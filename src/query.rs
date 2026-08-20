@@ -26,7 +26,7 @@ use dig_chainsource_interface::{ChainSource, CoinRecord};
 use num_bigint::BigInt;
 
 use crate::asset::mirror_coin_puzzle_hash;
-use crate::coin::MirrorCoin;
+use crate::coin::{Candidate, MirrorCoin};
 use crate::error::MirrorError;
 use crate::namespace::morph_store_launcher_id;
 
@@ -250,17 +250,39 @@ pub fn list<S: ChainSource>(
         // it silently, because an inventory that is quietly short understates the owner's money: an
         // unresolved candidate is recorded, and the caller is told.
         match authenticate(source, &candidate) {
-            Ok(Some(mirror)) if mirror.owner_puzzle_hash() == owner_puzzle_hash => {
+            Ok(Candidate::Mirror(mirror)) if mirror.owner_puzzle_hash() == owner_puzzle_hash => {
                 coins.push(mirror);
             }
+
             // Settled questions with the answer "not yours": somebody else's mirror coin, a coin at
             // this puzzle hash that advertises nothing (a sibling collateral coin, most likely), or
             // collateral that turns out not to be $DIG. None of them could have been this owner's.
-            Ok(_) | Err(MirrorError::NotDigCollateral { .. }) => {}
+            Ok(Candidate::Mirror(_) | Candidate::NotAMirror)
+            | Err(MirrorError::NotDigCollateral { .. }) => {}
+
+            // Memos that would not decode — and the owner is known anyway, because it comes from the
+            // lineage proof rather than from the memos. So this is settled too, for everyone except
+            // the one wallet that controls the coin. Reporting it to all of them instead would let a
+            // stranger's single mojo hold `is_complete()` false for every caller forever, which is
+            // the same denial this verb was fixed to resist, one level up and wearing the
+            // completeness claim instead of the query.
+            Ok(Candidate::UndecodableMemos {
+                owner_puzzle_hash: owner,
+                ..
+            }) if owner != owner_puzzle_hash => {}
+
+            // The caller's OWN coin, unreadable. This one is a real gap in their inventory, only
+            // they can have caused it, and it is precisely what they need to be told about.
+            Ok(Candidate::UndecodableMemos { detail, .. }) => skipped.push(SkippedCandidate {
+                coin_id,
+                reason: SkipReason::Undecodable(detail),
+            }),
+
             // The SOURCE could not answer. That is not a fact about one coin, so it is not a skip.
             Err(MirrorError::ChainUnavailable(reason)) => {
                 return Err(MirrorError::ChainUnavailable(reason))
             }
+
             Err(reason) => skipped.push(SkippedCandidate {
                 coin_id,
                 reason: skip_reason(reason),
@@ -301,7 +323,9 @@ pub fn discover<S: MirrorChainSource>(
         // is writable by anyone for the price of a dust coin, so one bad entry must not be able to
         // suppress every honest mirror. A source that could not ANSWER is different, and propagates.
         match authenticate(source, &candidate) {
-            Ok(Some(mirror)) if mirror.advertises(store_launcher_id, epoch) => claims.push(mirror),
+            Ok(Candidate::Mirror(mirror)) if mirror.advertises(store_launcher_id, epoch) => {
+                claims.push(mirror)
+            }
             Ok(_) => rejected += 1,
             Err(MirrorError::ChainUnavailable(reason)) => {
                 return Err(MirrorError::ChainUnavailable(reason))
@@ -322,20 +346,21 @@ pub fn discover<S: MirrorChainSource>(
 
 /// Re-derives a candidate coin from the spend that created it.
 ///
-/// This is where a hinted candidate stops being a rumour. `Ok(None)` means the coin is real but is
-/// not a mirror coin; `Err(MirrorError::Unauthenticated)` means its creating spend is missing, so
-/// nothing about it could be established.
+/// This is where a hinted candidate stops being a rumour. It returns a [`Candidate`] rather than an
+/// `Option` so that a coin whose memos would not decode still reports the owner it DID establish;
+/// `Err(MirrorError::Unauthenticated)` means the creating spend is missing, so nothing about the
+/// coin could be established at all — the one case where even the owner is unknown.
 fn authenticate<S: ChainSource>(
     source: &S,
     candidate: &CoinRecord,
-) -> Result<Option<MirrorCoin>, MirrorError> {
+) -> Result<Candidate, MirrorError> {
     let coin_id = candidate.coin.coin_id();
     let creating_spend: CoinSpend = source
         .coin_spend(candidate.coin.parent_coin_info)
         .map_err(unavailable)?
         .ok_or(MirrorError::Unauthenticated { coin_id })?;
 
-    MirrorCoin::from_creating_spend(&creating_spend, coin_id)
+    MirrorCoin::classify(&creating_spend, coin_id)
 }
 
 /// Reduces a per-candidate failure to the reason a caller can act on.

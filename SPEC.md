@@ -77,9 +77,21 @@ implementation MUST select the parent output whose derived coin id equals the ca
 NOT select the first output at the collateral puzzle hash: doing so loses every coin after the first
 while its collateral remains locked on chain, with no error and no error to report.
 
-A coin whose memos carry no URLs is NOT a mirror coin and MUST be excluded. This excludes sibling
-collateral coins sharing the same puzzle hash. It is a necessary condition only: memo shape is chosen
-by whoever spends the parent, so it MUST NOT be relied on against an adversary.
+A coin whose memos DECODE and carry no URLs is NOT a mirror coin and MUST be excluded. This excludes
+sibling collateral coins sharing the same puzzle hash. It is a necessary condition only: memo shape is
+chosen by whoever spends the parent, so it MUST NOT be relied on against an adversary.
+
+**Memos that decode and say nothing, and memos that cannot be decoded, are different facts and MUST
+NOT share a representation.** The first is an answer about the coin — read successfully, and the
+ordinary shape of a sibling collateral coin. The second is the absence of an answer. They are a word
+apart in English and opposite in consequence, and an implementation returning the same value for both
+makes the difference unrecoverable for every layer above it. That is the shape of defect this
+specification has already produced once (§7), so it is stated here at the level where it arises.
+
+An implementation MUST also carry forward what was established BEFORE the memos were read. The
+**owner** comes from the lineage proof and is settled at that point; the memos are arbitrary bytes
+chosen by whoever spent the parent. A coin with undecodable memos therefore still has a known owner,
+and §6.2 requires that owner to remain available rather than be discarded with the memo failure.
 
 ## 6. The verbs
 
@@ -97,7 +109,8 @@ The returned coin spends are unsigned.
 Answers *which mirror coins are mine*. An implementation MUST scan the shared mirror puzzle hash and
 keep coins whose authenticated lineage proof names the caller's puzzle hash.
 
-An empty result MUST mean the owner has locked no collateral.
+An empty result MUST mean the owner has locked no collateral, and MUST NOT be presented that way when
+the scan stopped early (§6.5).
 
 A candidate that cannot be authenticated MUST NOT abort the read (§6.5), and MUST NOT be dropped in
 silence either. It MUST be reported to the caller, identified by coin id and with the reason it could
@@ -108,6 +121,17 @@ route to `reclaim`, to whoever places one dust coin.
 
 A candidate settled as *not the caller's* — somebody else's mirror coin, a coin advertising no URLs,
 collateral that is not $DIG — is not unresolved and MUST NOT be reported as such.
+
+**A coin with undecodable memos whose OWNER is not the caller is settled too, and MUST NOT be reported
+as unresolved.** The owner is known regardless of the memos (§5), so the question *is this coin mine*
+has an answer, and for every caller but one that answer is no. An implementation that reports it to
+all of them makes the completeness signal jammable: one mojo at the shared puzzle hash would hold it
+false for every caller forever, and a consumer following the fail-closed advice above would then be
+denied exactly as thoroughly as an aborting `list` denied everybody. That is this section's own defect
+displaced one level up, and it MUST NOT be reintroduced there.
+
+The caller's OWN unreadable coin MUST still be reported. Only the wallet controlling a coin can have
+written its memos, so that gap is real, is theirs, and is what the signal exists to convey.
 
 ### 6.3 discover — keyed by store
 
@@ -184,4 +208,8 @@ An implementation conforms when:
 8. its `reclaim` hints the recreated coin to the owner (§6.4);
 9. a scan that reached its candidate bound is distinguishable by the caller from one that did not
    (§6.5);
-10. an empty result and an unreachable source are distinguishable by the caller in every verb.
+10. its `list` reports one undecodable coin as unresolved to the wallet that owns it and as settled to
+    every other caller (§6.2), so no stranger can hold the completeness signal false;
+11. memos that decoded and carried no URLs are distinguishable, inside the implementation, from memos
+    that could not be decoded at all (§5);
+12. an empty result and an unreachable source are distinguishable by the caller in every verb.

@@ -1,6 +1,6 @@
 # dig-mirror-coin — mirror coins, fully encapsulated.
 #
-# This crate owns the mirror-coin code outright: create, list, discover, melt. It deliberately does
+# This crate owns the mirror-coin code outright: create, list, discover, reclaim. It deliberately does
 # NOT depend on `datalayer-driver` and is not a re-export layer over anything. Chain reads arrive
 # through the canonical `ChainSource` trait (dig-chainsource-interface), so a 10-primitives crate
 # never pulls a network stack down into itself.
@@ -9,7 +9,7 @@ name = "dig-mirror-coin"
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.81.0"
-description = "Mirror coins: lock $DIG as collateral to advertise a DIG store mirror on Chia — create, list, discover, melt"
+description = "Mirror coins: lock $DIG as collateral to advertise a DIG store mirror on Chia — create, list, discover, reclaim"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DIG-Network/dig-mirror-coin"
 readme = "README.md"

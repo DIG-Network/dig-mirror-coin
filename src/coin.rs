@@ -107,6 +107,25 @@ impl MirrorCoin {
         creating_spend: &CoinSpend,
         coin_id: Bytes32,
     ) -> Result<Option<Self>, MirrorError> {
+        match Self::classify(creating_spend, coin_id)? {
+            Candidate::Mirror(mirror) => Ok(Some(mirror)),
+            Candidate::NotAMirror => Ok(None),
+            Candidate::UndecodableMemos { detail, .. } => Err(MirrorError::Malformed(detail)),
+        }
+    }
+
+    /// As [`from_creating_spend`](Self::from_creating_spend), but keeping what the execution had
+    /// already established when it ran out of things it could establish.
+    ///
+    /// The distinction exists for one reason. A coin's OWNER comes from the lineage proof and is
+    /// settled well before its memos are read; its memos are arbitrary bytes chosen by whoever spent
+    /// the parent. So when the memos will not decode, the question *is this coin mine* still has an
+    /// answer, and for every caller but one that answer is **no**. Collapsing the two into a single
+    /// `Err` throws that answer away and turns one stranger's dust into everybody's unresolved gap.
+    pub(crate) fn classify(
+        creating_spend: &CoinSpend,
+        coin_id: Bytes32,
+    ) -> Result<Candidate, MirrorError> {
         let mut allocator = Allocator::new();
 
         let puzzle_ptr = creating_spend
@@ -128,7 +147,7 @@ impl MirrorCoin {
             solution_ptr,
         )?
         else {
-            return Ok(None);
+            return Ok(Candidate::NotAMirror);
         };
 
         // `parse_child` answers with the parent's FIRST output at the collateral puzzle hash, which
@@ -142,7 +161,7 @@ impl MirrorCoin {
             let Some(sibling) =
                 sibling_child(&mut allocator, &first, parent_puzzle, solution_ptr, coin_id)?
             else {
-                return Ok(None);
+                return Ok(Candidate::NotAMirror);
             };
             sibling
         };
@@ -153,11 +172,24 @@ impl MirrorCoin {
             });
         }
 
-        let Some((namespace_hint, urls)) = parse_memos(&allocator, memos)? else {
-            return Ok(None);
+        // The owner is settled from here on, whatever the memos turn out to hold.
+        let owner_puzzle_hash = inner.proof.parent_inner_puzzle_hash;
+
+        let decoded = match parse_memos(&allocator, memos) {
+            Ok(decoded) => decoded,
+            Err(detail) => {
+                return Ok(Candidate::UndecodableMemos {
+                    owner_puzzle_hash,
+                    detail,
+                })
+            }
         };
 
-        Ok(Some(Self {
+        let Some((namespace_hint, urls)) = decoded else {
+            return Ok(Candidate::NotAMirror);
+        };
+
+        Ok(Candidate::Mirror(Self {
             inner,
             namespace_hint,
             urls,
@@ -168,6 +200,37 @@ impl MirrorCoin {
     pub(crate) fn inner(&self) -> &P2ParentCoin {
         &self.inner
     }
+}
+
+/// What a candidate coin turned out to be, once its creating spend was executed.
+///
+/// The three cases are not three flavours of failure. They differ in **what was established**, and a
+/// caller can only act correctly if that difference survives the return: two of them are settled
+/// answers and one is a genuine gap in knowledge.
+pub(crate) enum Candidate {
+    /// A mirror coin, fully re-derived from executed on-chain code.
+    Mirror(MirrorCoin),
+
+    /// Settled as not a mirror coin: the spend created no such output, the output is a different
+    /// coin, or the memos decoded cleanly and carried no advertised URLs.
+    ///
+    /// *Decoded and found no URLs* belongs here and nowhere else. It is a fact about the coin, read
+    /// successfully — the ordinary shape of a sibling collateral coin — and it must never be
+    /// confused with memos that could not be read at all.
+    NotAMirror,
+
+    /// The coin was authenticated as far as its OWNER, and then its memos would not decode.
+    ///
+    /// The owner is carried because it is genuinely known: it comes from the lineage proof, which is
+    /// established before a single memo byte is examined. Whether this is a gap in the caller's own
+    /// inventory or a stranger's malformed coin is therefore answerable, and the answer differs per
+    /// caller — which is exactly why this variant refuses to decide it here.
+    UndecodableMemos {
+        /// The wallet that controls the coin, from its lineage proof.
+        owner_puzzle_hash: Bytes32,
+        /// Why the memos could not be decoded.
+        detail: String,
+    },
 }
 
 /// Finds a LATER collateral output of the same parent spend — the one whose coin id is `coin_id`.
@@ -218,18 +281,20 @@ fn sibling_child(
 
 /// Splits a mirror coin's memos into its namespace value and its advertised URLs.
 ///
-/// Returns `Ok(None)` when the memos are not mirror-shaped — absent, empty, a first entry that is
-/// not a 32-byte namespace value, or no URLs after it.
+/// `Ok(None)` means the memos were READ and are not mirror-shaped — absent, empty, a first entry
+/// that is not a 32-byte namespace value, or no URLs after it. `Err(detail)` means they could not be
+/// read at all. The signature keeps those apart deliberately: the first is an answer about the coin,
+/// the second is the absence of one, and every caller above needs to treat them differently.
 fn parse_memos(
     allocator: &Allocator,
     memos: Memos,
-) -> Result<Option<(Bytes32, Vec<String>)>, MirrorError> {
+) -> Result<Option<(Bytes32, Vec<String>)>, String> {
     let Memos::Some(node) = memos else {
         return Ok(None);
     };
 
     let entries = Vec::<Bytes>::from_clvm(allocator, node)
-        .map_err(|error| MirrorError::Malformed(format!("undecodable memos: {error}")))?;
+        .map_err(|error| format!("undecodable memos: {error}"))?;
 
     let Some((namespace, advertised)) = entries.split_first() else {
         return Ok(None);

@@ -247,6 +247,27 @@ impl MirrorChainSource for FakeChain {
     }
 }
 
+/// Publishes a real 1-mojo $DIG coin at the shared mirror puzzle hash whose memos are `(0xAA . 0xBB)`
+/// — legal CLVM, an improper list, undecodable as a memo list.
+///
+/// Its creating spend is fully retrievable, so nothing about it needs a weak, pruned or light
+/// source: this is what one mojo buys against a perfect full node.
+fn publish_undecodable_coin(chain: &mut FakeChain, owner: &Wallet) -> Coin {
+    let (spend, coins) = creating_spend_of_children(owner, DIG_ASSET_ID, 1, |ctx| {
+        let improper = ctx
+            .alloc(&(Bytes::new(vec![0xAA]), Bytes::new(vec![0xBB])))
+            .unwrap();
+        vec![(1, Memos::Some(improper))]
+    });
+    chain.publish(
+        spend,
+        coins[0],
+        morph_store_launcher_id(store_a(), &epoch()),
+    );
+
+    coins[0]
+}
+
 /// A chain holding `count` dust coins at the shared mirror puzzle hash, all hinted to store A and
 /// none of them resolvable — what a deliberate flood looks like to either query.
 fn flooded_chain(count: usize) -> FakeChain {
@@ -444,28 +465,35 @@ fn list_discloses_a_candidate_it_could_not_authenticate_rather_than_dropping_or_
 
 /// The reason a caller is given distinguishes *the source did not have it* from *nobody could read
 /// it*, because only the first is worth retrying against a better source.
+/// The two disclosed reasons are not interchangeable: one is worth retrying against a better source
+/// and the other never will be, so a caller that cannot tell them apart cannot act on either.
+///
+/// Both are the caller's own here, because a stranger's is settled rather than disclosed.
 #[test]
 fn an_undecodable_candidate_is_disclosed_as_undecodable_not_as_unauthenticated() {
     let mine = wallet(1);
-    let stranger = wallet(9);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+    publish_undecodable_coin(&mut chain, &mine);
 
-    let (spend, junk) = creating_spend_of_children(&stranger, DIG_ASSET_ID, 1, |ctx| {
-        let improper = ctx
-            .alloc(&(Bytes::new(vec![0xAA]), Bytes::new(vec![0xBB])))
-            .unwrap();
-        vec![(1, Memos::Some(improper))]
-    });
-    chain.publish(spend, junk[0], morph_store_launcher_id(store_a(), &epoch()));
+    let orphan = Coin::new(Bytes32::new([0x55; 32]), mirror_coin_puzzle_hash(), 7);
+    chain.publish_without_creating_spend(orphan, morph_store_launcher_id(store_a(), &epoch()));
 
     let inventory = list(&chain, mine.puzzle_hash).expect("the source answered");
+    let orphan_reason = inventory
+        .skipped()
+        .iter()
+        .find(|skipped| skipped.coin_id() == orphan.coin_id())
+        .expect("the coin with no creating spend is disclosed")
+        .reason();
+    let unreadable_reason = inventory
+        .skipped()
+        .iter()
+        .find(|skipped| skipped.coin_id() != orphan.coin_id())
+        .expect("the coin with undecodable memos is disclosed")
+        .reason();
 
-    assert_eq!(inventory.skipped().len(), 1);
-    assert!(matches!(
-        inventory.skipped()[0].reason(),
-        SkipReason::Undecodable(_)
-    ));
+    assert_eq!(orphan_reason, &SkipReason::Unauthenticated);
+    assert!(matches!(unreadable_reason, SkipReason::Undecodable(_)));
 }
 
 /// An inventory that resolved every candidate says so, or `is_complete` would be a constant.
@@ -523,20 +551,77 @@ fn a_strangers_undecodable_coin_does_not_deny_an_owner_their_inventory() {
     let stranger = wallet(9);
     let mut chain = FakeChain::default();
     publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
-
-    let (spend, junk) = creating_spend_of_children(&stranger, DIG_ASSET_ID, 1, |ctx| {
-        let improper = ctx
-            .alloc(&(Bytes::new(vec![0xAA]), Bytes::new(vec![0xBB])))
-            .unwrap();
-        vec![(1, Memos::Some(improper))]
-    });
-    chain.publish(spend, junk[0], morph_store_launcher_id(store_a(), &epoch()));
+    publish_undecodable_coin(&mut chain, &stranger);
 
     let inventory = list(&chain, mine.puzzle_hash)
         .expect("one stranger's junk coin must not deny an unrelated owner their own inventory");
 
     assert_eq!(inventory.coins().len(), 1);
     assert_eq!(inventory.coins()[0].urls(), ["https://mine.example"]);
+}
+
+/// The completeness signal MUST NOT be jammable by somebody else's coin.
+///
+/// A caller that follows this crate's own fail-closed advice refuses to act while `is_complete()` is
+/// false. If a stranger's dust could hold it false, that caller is denied exactly as thoroughly as
+/// the original `Err` denied everybody — the same defect one level up, wearing the completeness
+/// claim instead of the query. It cannot, because the owner is read from the lineage proof, which is
+/// settled before a single memo byte is examined.
+///
+/// This test and the next are ONE fixture with ONE actor varied: the same undecodable coin, owned by
+/// a stranger here and by the caller there. Either alone is satisfied by a wrong implementation —
+/// always-skip passes the second, never-skip passes the first — and only the pair pins the rule.
+#[test]
+fn a_strangers_undecodable_coin_cannot_jam_the_completeness_signal() {
+    let mine = wallet(1);
+    let stranger = wallet(9);
+    let mut chain = FakeChain::default();
+    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+    let junk = publish_undecodable_coin(&mut chain, &stranger);
+
+    let inventory = list(&chain, mine.puzzle_hash).expect("the source answered");
+
+    assert!(
+        inventory.is_complete(),
+        "a coin the caller demonstrably does not own is a settled question, not a gap in their inventory; got skipped = {:?}",
+        inventory.skipped()
+    );
+    assert!(inventory.skipped().is_empty());
+    assert_ne!(
+        junk.coin_id(),
+        inventory.coins()[0].coin().coin_id(),
+        "the fixture must really contain the stranger's coin beside the honest one"
+    );
+}
+
+/// The caller's OWN unreadable coin is still disclosed, which is what stops the fix above from being
+/// a licence to drop everything quietly.
+///
+/// Only the wallet controlling a coin can have written its memos, so this gap is real, it is theirs,
+/// and it is the one they need to be told about.
+#[test]
+fn the_owners_own_undecodable_coin_is_still_disclosed_to_them() {
+    let mine = wallet(1);
+    let mut chain = FakeChain::default();
+    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+    let mine_but_unreadable = publish_undecodable_coin(&mut chain, &mine);
+
+    let inventory = list(&chain, mine.puzzle_hash).expect("the source answered");
+
+    assert_eq!(inventory.coins().len(), 1);
+    assert!(
+        !inventory.is_complete(),
+        "an inventory holding an unreadable coin of the caller's OWN must not claim to be whole"
+    );
+    assert_eq!(inventory.skipped().len(), 1);
+    assert_eq!(
+        inventory.skipped()[0].coin_id(),
+        mine_but_unreadable.coin_id()
+    );
+    assert!(matches!(
+        inventory.skipped()[0].reason(),
+        SkipReason::Undecodable(_)
+    ));
 }
 
 /// Two mirror coins created by ONE parent spend are BOTH the owner's money, so both MUST be found.
