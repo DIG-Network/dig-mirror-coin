@@ -436,7 +436,10 @@ fn list_discloses_a_candidate_it_could_not_authenticate_rather_than_dropping_or_
     );
     assert_eq!(inventory.skipped().len(), 1);
     assert_eq!(inventory.skipped()[0].coin_id(), orphan.coin_id());
-    assert_eq!(inventory.skipped()[0].reason(), &SkipReason::Unauthenticated);
+    assert_eq!(
+        inventory.skipped()[0].reason(),
+        &SkipReason::Unauthenticated
+    );
 }
 
 /// The reason a caller is given distinguishes *the source did not have it* from *nobody could read
@@ -662,7 +665,10 @@ fn reclaim_is_refused_for_a_wallet_that_does_not_control_the_coin() {
     let mut chain = FakeChain::default();
     publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
 
-    let mirror = list(&chain, owner.puzzle_hash).expect("the source answered").coins()[0].clone();
+    let mirror = list(&chain, owner.puzzle_hash)
+        .expect("the source answered")
+        .coins()[0]
+        .clone();
     let error =
         reclaim(&mirror, attacker.public_key, vec![], 0).expect_err("only the owner may reclaim");
 
@@ -682,7 +688,10 @@ fn reclaim_recreates_the_entire_collateral_as_dig_at_the_owners_address() {
     let mut chain = FakeChain::default();
     publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
 
-    let mirror = list(&chain, owner.puzzle_hash).expect("the source answered").coins()[0].clone();
+    let mirror = list(&chain, owner.puzzle_hash)
+        .expect("the source answered")
+        .coins()[0]
+        .clone();
     let spends = reclaim(&mirror, owner.public_key, vec![], 0).expect("the owner may reclaim");
 
     let spend = spends
@@ -698,6 +707,58 @@ fn reclaim_recreates_the_entire_collateral_as_dig_at_the_owners_address() {
         outputs.contains(&(expected_puzzle_hash, COLLATERAL)),
         "expected the whole collateral back as $DIG at the owner's address; got {outputs:?}"
     );
+}
+
+/// Returning the money is not enough if no wallet can find it.
+///
+/// A CAT coin sits at a puzzle hash that reveals nothing about its owner, so wallets locate one by
+/// its hint. A reclaim that recreates the collateral with no hint produces a coin that is spendable
+/// in principle and missing from the balance its owner is shown — indistinguishable, to the person,
+/// from collateral that never came back.
+#[test]
+fn reclaimed_collateral_is_hinted_to_the_owner_so_a_wallet_can_find_it() {
+    let owner = wallet(1);
+    let mut chain = FakeChain::default();
+    publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
+
+    let inventory = list(&chain, owner.puzzle_hash).expect("the source answered");
+    let spends =
+        reclaim(&inventory.coins()[0], owner.public_key, vec![], 0).expect("the owner may reclaim");
+
+    let spend = spends
+        .iter()
+        .find(|spend| spend.coin == inventory.coins()[0].coin())
+        .expect("the mirror coin is spent");
+    let returned_puzzle_hash: Bytes32 =
+        CatArgs::curry_tree_hash(DIG_ASSET_ID, TreeHash::from(owner.puzzle_hash)).into();
+
+    assert_eq!(
+        create_coin_memos(spend, returned_puzzle_hash),
+        vec![Bytes::new(owner.puzzle_hash.to_vec())],
+        "the returned collateral must be hinted to the owner's own puzzle hash"
+    );
+}
+
+/// The memos carried by the `CREATE_COIN` output of `spend` that pays `puzzle_hash`.
+fn create_coin_memos(spend: &CoinSpend, puzzle_hash: Bytes32) -> Vec<Bytes> {
+    let mut allocator = Allocator::new();
+    let puzzle = spend.puzzle_reveal.to_clvm(&mut allocator).unwrap();
+    let solution = spend.solution.to_clvm(&mut allocator).unwrap();
+    let output = run_puzzle(&mut allocator, puzzle, solution).unwrap();
+
+    Conditions::<clvmr::NodePtr>::from_clvm(&allocator, output)
+        .unwrap()
+        .into_iter()
+        .find_map(|condition| match condition {
+            Condition::CreateCoin(created) if created.puzzle_hash == puzzle_hash => {
+                Some(match created.memos {
+                    Memos::Some(node) => Vec::<Bytes>::from_clvm(&allocator, node).unwrap(),
+                    Memos::None => Vec::new(),
+                })
+            }
+            _ => None,
+        })
+        .expect("an output paying that puzzle hash")
 }
 
 /// Runs a coin spend's puzzle against its solution and collects its `CREATE_COIN` outputs.
@@ -855,7 +916,10 @@ fn reclaim_with_a_fee_still_returns_the_whole_collateral() {
     let mut chain = FakeChain::default();
     publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
 
-    let mirror = list(&chain, owner.puzzle_hash).expect("the source answered").coins()[0].clone();
+    let mirror = list(&chain, owner.puzzle_hash)
+        .expect("the source answered")
+        .coins()[0]
+        .clone();
     let fee_coin = Coin::new(Bytes32::new([0x31; 32]), owner.puzzle_hash, 10_000);
 
     let spends =
@@ -885,7 +949,10 @@ fn a_parsed_mirror_reports_its_own_coin_and_lineage() {
     let mut chain = FakeChain::default();
     let published = publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
 
-    let mirror = list(&chain, owner.puzzle_hash).expect("the source answered").coins()[0].clone();
+    let mirror = list(&chain, owner.puzzle_hash)
+        .expect("the source answered")
+        .coins()[0]
+        .clone();
 
     assert_eq!(mirror.coin(), published);
     assert_eq!(mirror.coin().puzzle_hash, mirror_coin_puzzle_hash());

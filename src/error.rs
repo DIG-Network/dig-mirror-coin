@@ -45,13 +45,6 @@ pub enum MirrorError {
         coin_id: Bytes32,
     },
 
-    /// A coin presented for reclaim has already been spent, so its collateral is no longer locked.
-    #[error("mirror coin {coin_id} has already been spent")]
-    AlreadySpent {
-        /// The coin that was already spent.
-        coin_id: Bytes32,
-    },
-
     /// The creating spend of a candidate coin could not be found, so the coin could not be
     /// authenticated as a mirror coin.
     ///

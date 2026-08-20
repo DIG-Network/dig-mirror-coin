@@ -6,14 +6,20 @@
 //! | [`discover`] | who mirrors this store? | store launcher id | nobody advertises it |
 //!
 //! They resist collapsing into one function because their **trust** differs, not just their key.
-//! `list` is about the caller's own money, so it authenticates every coin it returns and refuses to
-//! answer at all if any candidate cannot be authenticated — under-reporting your own collateral is
-//! worse than reporting nothing. `discover` reads an index anyone can write into, so a candidate it
-//! cannot authenticate is *dropped* rather than fatal; refusing the whole query would let one dust
-//! coin hide every honest mirror.
+//! `list` is about the caller's own money, so under-reporting it is a real harm and every candidate
+//! it could not resolve is named back to the caller. `discover` reads an index anyone can write
+//! into, where unresolvable entries are ordinary noise, so it counts them and moves on.
+//!
+//! What they share is that **neither is deniable by one coin**. Both walk lists a stranger can add
+//! to for the price of dust, so neither may let one candidate's contents decide the fate of the
+//! whole query — an early version of `list` did, and a single 1-mojo coin carrying undecodable memos
+//! took the verb away from every user of the network, permanently, along with the only supported
+//! route to [`reclaim`](crate::reclaim). Both bound their work at [`MAX_CANDIDATES`] for the same
+//! reason, and both disclose when that bound was reached rather than refusing or staying quiet.
 //!
 //! Both preserve the same distinction at the boundary: an empty result is an answer, an `Err` is the
-//! absence of one. Neither ever degrades an unreachable source into "nothing found".
+//! absence of one. Neither ever degrades an unreachable source into "nothing found", and neither
+//! ever promotes one unreadable coin into an unreachable source.
 
 use chia_protocol::{Bytes32, CoinSpend};
 use dig_chainsource_interface::{ChainSource, CoinRecord};

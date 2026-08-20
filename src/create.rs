@@ -29,7 +29,7 @@ pub struct MirrorAdvertisement {
     pub epoch: BigInt,
     /// Where the store can be fetched from. MUST be non-empty.
     pub urls: Vec<String>,
-    /// The $DIG locked behind the claim, in mojos.
+    /// The $DIG locked behind the claim, in mojos. MUST be non-zero.
     pub collateral: u64,
 }
 
@@ -44,6 +44,11 @@ pub struct MirrorAdvertisement {
 /// mirror, and the published URLs are also what distinguishes a mirror coin from a sibling
 /// collateral coin sharing the same puzzle — see
 /// [`MirrorCoin::from_creating_spend`](crate::MirrorCoin::from_creating_spend).
+///
+/// The collateral MUST be non-zero. The whole premise of a mirror coin is that a claim costs
+/// something, and a claim staked on nothing is free — so zero is refused here rather than described
+/// as staked. The crate deliberately sets no higher floor: what amount is *enough* is an economic
+/// question for the network, and baking a number in would freeze it into a wire constant.
 pub fn create(
     advertisement: MirrorAdvertisement,
     dig_coins: Vec<Cat>,
@@ -61,6 +66,15 @@ pub fn create(
     if urls.is_empty() {
         return Err(MirrorError::Malformed(
             "a mirror must advertise at least one URL".to_string(),
+        ));
+    }
+
+    // A zero-collateral mirror is a claim that cost nothing, which is the one thing this coin exists
+    // to prevent. How much is enough is a policy the network sets, not this crate; that nothing is
+    // never enough is structural, so it is enforced here.
+    if collateral == 0 {
+        return Err(MirrorError::Malformed(
+            "a mirror must lock a non-zero amount of $DIG as collateral".to_string(),
         ));
     }
 
@@ -127,6 +141,27 @@ mod tests {
             0,
         )
         .expect_err("a mirror with no URLs must be refused");
+
+        assert!(matches!(error, MirrorError::Malformed(_)));
+    }
+
+    /// The stake is what makes a mirror claim cost something, so a claim staked on nothing is not a
+    /// mirror. The URLs are present here so the refusal can only be about the collateral.
+    #[test]
+    fn creation_without_collateral_is_refused() {
+        let error = create(
+            MirrorAdvertisement {
+                store_launcher_id: Bytes32::new([1u8; 32]),
+                epoch: BigInt::from(0),
+                urls: vec!["https://mirror.example".to_string()],
+                collateral: 0,
+            },
+            vec![],
+            any_key(),
+            vec![],
+            0,
+        )
+        .expect_err("a mirror staked on nothing must be refused");
 
         assert!(matches!(error, MirrorError::Malformed(_)));
     }

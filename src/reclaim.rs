@@ -18,7 +18,6 @@
 
 use chia_bls::PublicKey;
 use chia_protocol::{Bytes32, Coin, CoinSpend};
-use chia_puzzle_types::Memos;
 use chia_sdk_driver::{Action, Relation, SpendContext, SpendWithConditions, Spends, StandardLayer};
 use chia_sdk_types::{conditions::AssertConcurrentSpend, Conditions};
 use clvm_utils::ToTreeHash;
@@ -57,8 +56,12 @@ pub fn reclaim(
 
     // The entire collateral is recreated at the owner's puzzle hash. This is the line that makes
     // reclaim a reclaim: the amount out equals the amount that was locked.
-    let returned =
-        Conditions::new().create_coin(owner_puzzle_hash, mirror.collateral(), Memos::None);
+    //
+    // It is hinted to the owner because wallets find CAT coins by hint. Money that arrives with no
+    // hint arrives invisibly: the collateral would be spendable in principle and absent from the
+    // balance the owner is shown, which is the same lie as losing it.
+    let hint = ctx.hint(owner_puzzle_hash)?;
+    let returned = Conditions::new().create_coin(owner_puzzle_hash, mirror.collateral(), hint);
     let owner_spend = owner.spend_with_conditions(&mut ctx, returned)?;
     mirror.inner().spend(&mut ctx, owner_spend, ())?;
 
