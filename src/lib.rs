@@ -74,7 +74,10 @@ pub use coin::MirrorCoin;
 pub use create::{create, MirrorAdvertisement};
 pub use error::MirrorError;
 pub use namespace::{morph_store_launcher_id, MIRROR_NAMESPACE};
-pub use query::{discover, list, MirrorChainSource, MirrorSet};
+pub use query::{
+    discover, list, MirrorChainSource, MirrorInventory, MirrorSet, SkipReason, SkippedCandidate,
+    MAX_CANDIDATES,
+};
 pub use reclaim::reclaim;
 
 /// The crate version, sourced from `Cargo.toml` at build time.

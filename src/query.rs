@@ -99,38 +99,148 @@ impl MirrorSet {
     }
 }
 
+/// A caller's own mirror coins, and an honest account of anything the scan could not resolve.
+///
+/// `list` scans a puzzle hash shared by every mirror coin in existence, so the overwhelming majority
+/// of what it walks belongs to strangers. Most of that is resolved and discarded silently — a coin
+/// that is definitively *not a mirror coin* is simply not the caller's, and saying so about every
+/// sibling collateral coin on the chain would be noise.
+///
+/// What is **not** silent is a candidate whose nature could not be established at all. Those are
+/// recorded in [`skipped`](Self::skipped), because they are the only ones that could conceivably
+/// have been the caller's own money. An inventory with a non-empty `skipped` list MAY be short, and
+/// [`is_complete`](Self::is_complete) says so in one call.
+#[derive(Debug)]
+pub struct MirrorInventory {
+    owner_puzzle_hash: Bytes32,
+    coins: Vec<MirrorCoin>,
+    skipped: Vec<SkippedCandidate>,
+    truncated: bool,
+}
+
+impl MirrorInventory {
+    /// The owner these coins were sought for.
+    pub fn owner_puzzle_hash(&self) -> Bytes32 {
+        self.owner_puzzle_hash
+    }
+
+    /// The authenticated mirror coins this owner controls.
+    pub fn coins(&self) -> &[MirrorCoin] {
+        &self.coins
+    }
+
+    /// The candidates whose nature could not be established, with the reason for each.
+    ///
+    /// Non-empty means the scan met chain data it could not interpret — an undecodable memo, a
+    /// creating spend the source could not produce. Such a coin costs one mojo to place at the
+    /// shared mirror puzzle hash, so a stranger can always put one there; what a caller learns here
+    /// is exactly which coin ids were affected and why, rather than either a silent omission or a
+    /// denied query.
+    pub fn skipped(&self) -> &[SkippedCandidate] {
+        &self.skipped
+    }
+
+    /// Whether the scan reached the end of the candidate list without exceeding
+    /// [`MAX_CANDIDATES`].
+    ///
+    /// `false` means the scan stopped early and coins beyond the limit were never examined.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Whether every candidate was resolved, so this inventory is known to be the whole of it.
+    ///
+    /// `false` does NOT mean a coin is missing — it means one might be. A caller that would rather
+    /// refuse than under-report its own money checks this and fails closed; that decision belongs to
+    /// the caller, because only the caller knows what it is about to do with the answer.
+    pub fn is_complete(&self) -> bool {
+        self.skipped.is_empty() && !self.truncated
+    }
+}
+
+/// A candidate coin that could not be resolved into a yes-or-no answer, and why.
+#[derive(Debug, Clone)]
+pub struct SkippedCandidate {
+    coin_id: Bytes32,
+    reason: SkipReason,
+}
+
+impl SkippedCandidate {
+    /// The coin that could not be resolved.
+    pub fn coin_id(&self) -> Bytes32 {
+        self.coin_id
+    }
+
+    /// Why it could not be resolved.
+    pub fn reason(&self) -> &SkipReason {
+        &self.reason
+    }
+}
+
+/// Why a candidate coin could not be resolved.
+///
+/// `#[non_exhaustive]`: further reasons may arrive in a minor release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkipReason {
+    /// The coin's creating spend could not be produced, so nothing about it could be established.
+    Unauthenticated,
+    /// The coin's creating spend was produced but could not be interpreted — an undecodable memo
+    /// list, a puzzle that did not run. Carries the diagnostic verbatim.
+    Undecodable(String),
+}
+
+/// The most candidates either query will examine in one call.
+///
+/// Both queries walk lists that anyone may add to for the price of a dust coin, so the work they do
+/// is driven by attacker-writable input and MUST be bounded. The bound is a stop, never a refusal:
+/// refusing at the limit would hand an attacker a cheaper version of the very denial this bound
+/// exists to prevent, so a query that reaches it returns what it found and says plainly that it
+/// stopped early ([`MirrorInventory::is_truncated`], [`MirrorSet::is_truncated`]).
+pub const MAX_CANDIDATES: usize = 10_000;
+
 /// Answers *which mirror coins are mine*, keyed by the owner's puzzle hash.
 ///
 /// Scans the shared mirror puzzle hash and keeps the coins whose lineage proof names
 /// `owner_puzzle_hash` as the controlling wallet. Ownership therefore comes from executed on-chain
 /// code, not from a hint, and no wallet can be made to see somebody else's coin as its own.
 ///
-/// An empty `Vec` means the owner has no locked collateral. An `Err` means the answer could not be
-/// established — including [`MirrorError::Unauthenticated`] when a candidate's creating spend is
-/// missing, which is deliberately fatal here: silently omitting a coin from an owner's own inventory
-/// would understate their money.
+/// An empty [`MirrorInventory::coins`] means the owner has no locked collateral. An `Err` means the
+/// **source** could not answer, and never that one coin on it was odd — see
+/// [`MirrorInventory::skipped`] for that, and [`MirrorInventory::is_complete`] for whether it
+/// happened at all.
 pub fn list<S: ChainSource>(
     source: &S,
     owner_puzzle_hash: Bytes32,
-) -> Result<Vec<MirrorCoin>, MirrorError> {
+) -> Result<MirrorInventory, MirrorError> {
     let candidates = source
         .coin_records_by_puzzle_hash(mirror_coin_puzzle_hash(), false)
         .map_err(unavailable)?;
 
-    let mut owned = Vec::new();
-    for candidate in candidates {
+    let truncated = candidates.len() > MAX_CANDIDATES;
+    let mut coins = Vec::new();
+    let mut skipped = Vec::new();
+
+    for candidate in candidates.into_iter().take(MAX_CANDIDATES) {
+        let coin_id = candidate.coin.coin_id();
         let Some(mirror) = authenticate(source, &candidate)? else {
             // The coin pays to the mirror puzzle but is not a mirror coin — a sibling collateral
             // coin with no advertised URLs, most likely. Not this verb's business.
             continue;
         };
+        let _ = (&mut skipped, coin_id);
 
         if mirror.owner_puzzle_hash() == owner_puzzle_hash {
-            owned.push(mirror);
+            coins.push(mirror);
         }
     }
 
-    Ok(owned)
+    Ok(MirrorInventory {
+        owner_puzzle_hash,
+        coins,
+        skipped,
+        truncated,
+    })
 }
 
 /// Answers *who mirrors this store*, keyed by the store launcher id and epoch.
