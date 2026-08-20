@@ -1,8 +1,15 @@
+# dig-mirror-coin — mirror coins, fully encapsulated.
+#
+# This crate owns the mirror-coin code outright: create, list, discover, melt. It deliberately does
+# NOT depend on `datalayer-driver` and is not a re-export layer over anything. Chain reads arrive
+# through the canonical `ChainSource` trait (dig-chainsource-interface), so a 10-primitives crate
+# never pulls a network stack down into itself.
 [package]
 name = "dig-mirror-coin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Mirror coins: lock $DIG as collateral to advertise a DIG store mirror on Chia"
+rust-version = "1.81.0"
+description = "Mirror coins: lock $DIG as collateral to advertise a DIG store mirror on Chia — create, list, discover, melt"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DIG-Network/dig-mirror-coin"
 readme = "README.md"
@@ -10,14 +17,19 @@ keywords = ["chia", "dig", "cat", "collateral", "mirror"]
 categories = ["cryptography::cryptocurrencies"]
 
 [dependencies]
+dig-chainsource-interface = "0.2"
+
+chia-bls = "0.26.0"
 chia-protocol = "0.26.0"
 chia-puzzle-types = "0.26.0"
 chia-puzzles = "0.20.1"
-chia-sdk-types = "0.27.2"
+chia-sdk-driver = { version = "0.30.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-types = { version = "0.30.0", features = ["chip-0035", "action-layer"] }
 clvm-traits = "0.26.0"
 clvm-utils = "0.26.0"
 clvmr = "0.14.0"
 hex-literal = "0.4"
+indexmap = "2.11.4"
 num-bigint = "0.4.6"
 thiserror = "1.0.61"
 
