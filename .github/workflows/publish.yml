@@ -75,19 +75,19 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "dig-did v${{ steps.extract_version.outputs.VERSION }}"
+          name: "dig-mirror-coin v${{ steps.extract_version.outputs.VERSION }}"
           body: |
-            ## dig-did v${{ steps.extract_version.outputs.VERSION }}
+            ## dig-mirror-coin v${{ steps.extract_version.outputs.VERSION }}
 
-            The DIG Network canonical Chia DID expert crate: a pure, key-free, network-free
-            SpendBundle-builder for Chia Decentralized Identifiers. Builds the exact CoinSpends for
-            every DID lifecycle operation and reports the exact signatures a caller must produce —
-            never holds a key, never signs, never broadcasts.
+            Mirror coins, fully encapsulated: lock $DIG as collateral to advertise a DIG store
+            mirror on Chia — create, list, discover, reclaim. Chain reads arrive through the
+            canonical `ChainSource` trait, so this crate never pulls a network stack down into
+            itself, and it never holds a key, signs, or broadcasts.
 
             ### Installation
             ```toml
             [dependencies]
-            dig-did = "${{ steps.extract_version.outputs.VERSION }}"
+            dig-mirror-coin = "${{ steps.extract_version.outputs.VERSION }}"
             ```
           draft: false
           prerelease: false
