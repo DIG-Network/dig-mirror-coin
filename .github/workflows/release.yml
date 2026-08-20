@@ -73,7 +73,11 @@ jobs:
       # guarantees every tagged release ships a Cargo.lock in sync with Cargo.toml.
       - name: Sync Cargo.lock to the bumped version
         if: steps.ver.outputs.skip == 'false' && hashFiles('Cargo.toml') != ''
-        run: cargo update -p dig-did
+        # Derive the package name from Cargo.toml rather than hardcoding it. This step arrived
+        # from a template still naming another crate, which failed the release outright
+        # ("package ID specification `dig-did` did not match any packages"). Deriving it means
+        # the next repo to copy this file is correct on arrival instead of red on first release.
+        run: cargo update -p "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')"
 
       - name: Commit changelog + lock, tag, push
         if: steps.ver.outputs.skip == 'false'

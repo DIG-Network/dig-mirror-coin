@@ -6,7 +6,7 @@
 # never pulls a network stack down into itself.
 [package]
 name = "dig-mirror-coin"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.81.0"
 description = "Mirror coins: lock $DIG as collateral to advertise a DIG store mirror on Chia — create, list, discover, reclaim"

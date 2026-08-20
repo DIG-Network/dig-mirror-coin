@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "dig-mirror-coin"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chia-bls 0.26.0",
  "chia-protocol",
