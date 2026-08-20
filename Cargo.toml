@@ -1,0 +1,25 @@
+[package]
+name = "dig-mirror-coin"
+version = "0.1.0"
+edition = "2021"
+description = "Mirror coins: lock $DIG as collateral to advertise a DIG store mirror on Chia"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DIG-Network/dig-mirror-coin"
+readme = "README.md"
+keywords = ["chia", "dig", "cat", "collateral", "mirror"]
+categories = ["cryptography::cryptocurrencies"]
+
+[dependencies]
+chia-protocol = "0.26.0"
+chia-puzzle-types = "0.26.0"
+chia-puzzles = "0.20.1"
+chia-sdk-types = "0.27.2"
+clvm-traits = "0.26.0"
+clvm-utils = "0.26.0"
+clvmr = "0.14.0"
+hex-literal = "0.4"
+num-bigint = "0.4.6"
+thiserror = "1.0.61"
+
+[dev-dependencies]
+hex = "0.4"
