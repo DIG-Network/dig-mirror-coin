@@ -57,6 +57,7 @@ pub struct MirrorSet {
     namespace_hint: Bytes32,
     claims: Vec<MirrorCoin>,
     rejected: usize,
+    truncated: bool,
 }
 
 impl MirrorSet {
@@ -84,9 +85,21 @@ impl MirrorSet {
 
     /// Whether the source found nobody advertising this store for this epoch.
     ///
-    /// True only for a completed read. A read that failed is an `Err` and never reaches this method.
+    /// A read that failed is an `Err` and never reaches this method. A read that stopped early does
+    /// reach it, so `is_empty()` means *nobody advertises this store* only when
+    /// [`is_truncated`](Self::is_truncated) is `false`; otherwise it means *nobody in the part that
+    /// was examined*.
     pub fn is_empty(&self) -> bool {
         self.claims.is_empty()
+    }
+
+    /// Whether the hint index held more than [`MAX_CANDIDATES`] entries, so the scan stopped early.
+    ///
+    /// A flood large enough to trip this is visible rather than silent, which is the point: the
+    /// alternative is either unbounded work or a confident "nobody mirrors this" that an attacker
+    /// bought for the price of dust.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
     }
 
     /// How many hinted candidates were dropped because they could not be authenticated as mirror
@@ -223,15 +236,29 @@ pub fn list<S: ChainSource>(
 
     for candidate in candidates.into_iter().take(MAX_CANDIDATES) {
         let coin_id = candidate.coin.coin_id();
-        let Some(mirror) = authenticate(source, &candidate)? else {
-            // The coin pays to the mirror puzzle but is not a mirror coin — a sibling collateral
-            // coin with no advertised URLs, most likely. Not this verb's business.
-            continue;
-        };
-        let _ = (&mut skipped, coin_id);
 
-        if mirror.owner_puzzle_hash() == owner_puzzle_hash {
-            coins.push(mirror);
+        // Every mirror coin in existence shares this puzzle hash, so nearly every candidate here
+        // belongs to a stranger. A per-candidate failure therefore says nothing about the caller's
+        // own money, and propagating one would let a single coin — one mojo, placed by anybody —
+        // deny this query to every user of the network at once. What is NOT acceptable is dropping
+        // it silently, because an inventory that is quietly short understates the owner's money: an
+        // unresolved candidate is recorded, and the caller is told.
+        match authenticate(source, &candidate) {
+            Ok(Some(mirror)) if mirror.owner_puzzle_hash() == owner_puzzle_hash => {
+                coins.push(mirror);
+            }
+            // Settled questions with the answer "not yours": somebody else's mirror coin, a coin at
+            // this puzzle hash that advertises nothing (a sibling collateral coin, most likely), or
+            // collateral that turns out not to be $DIG. None of them could have been this owner's.
+            Ok(_) | Err(MirrorError::NotDigCollateral { .. }) => {}
+            // The SOURCE could not answer. That is not a fact about one coin, so it is not a skip.
+            Err(MirrorError::ChainUnavailable(reason)) => {
+                return Err(MirrorError::ChainUnavailable(reason))
+            }
+            Err(reason) => skipped.push(SkippedCandidate {
+                coin_id,
+                reason: skip_reason(reason),
+            }),
         }
     }
 
@@ -259,10 +286,11 @@ pub fn discover<S: MirrorChainSource>(
         .unspent_coins_by_hint(namespace_hint)
         .map_err(unavailable)?;
 
+    let truncated = candidates.len() > MAX_CANDIDATES;
     let mut claims = Vec::new();
     let mut rejected = 0usize;
 
-    for candidate in candidates {
+    for candidate in candidates.into_iter().take(MAX_CANDIDATES) {
         // A candidate that fails to authenticate is index noise, not a failed query: the hint index
         // is writable by anyone for the price of a dust coin, so one bad entry must not be able to
         // suppress every honest mirror. A source that could not ANSWER is different, and propagates.
@@ -282,6 +310,7 @@ pub fn discover<S: MirrorChainSource>(
         namespace_hint,
         claims,
         rejected,
+        truncated,
     })
 }
 
@@ -301,6 +330,18 @@ fn authenticate<S: ChainSource>(
         .ok_or(MirrorError::Unauthenticated { coin_id })?;
 
     MirrorCoin::from_creating_spend(&creating_spend, coin_id)
+}
+
+/// Reduces a per-candidate failure to the reason a caller can act on.
+///
+/// The distinction that survives is the one a caller can do something about: a coin whose creating
+/// spend the source simply did not have MAY appear on a better source, while a coin whose creating
+/// spend could not be interpreted will read the same way everywhere.
+fn skip_reason(error: MirrorError) -> SkipReason {
+    match error {
+        MirrorError::Unauthenticated { .. } => SkipReason::Unauthenticated,
+        other => SkipReason::Undecodable(other.to_string()),
+    }
 }
 
 /// Maps a chain source's own error into the crate's single "could not establish" variant.

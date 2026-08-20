@@ -11,8 +11,9 @@
 use chia_protocol::{Bytes, Bytes32, Coin, CoinSpend};
 use chia_puzzle_types::{LineageProof, Memos};
 use chia_sdk_driver::{P2ParentCoin, Puzzle};
+use chia_sdk_types::{run_puzzle, Condition, Conditions};
 use clvm_traits::{FromClvm, ToClvm};
-use clvmr::Allocator;
+use clvmr::{Allocator, NodePtr};
 use num_bigint::BigInt;
 
 use crate::asset::DIG_ASSET_ID;
@@ -120,7 +121,7 @@ impl MirrorCoin {
             .map_err(|error| MirrorError::Malformed(format!("undecodable solution: {error}")))?;
 
         let parent_puzzle = Puzzle::parse(&allocator, puzzle_ptr);
-        let Some((inner, memos)) = P2ParentCoin::parse_child(
+        let Some((first, first_memos)) = P2ParentCoin::parse_child(
             &mut allocator,
             creating_spend.coin,
             parent_puzzle,
@@ -130,9 +131,21 @@ impl MirrorCoin {
             return Ok(None);
         };
 
-        if inner.coin.coin_id() != coin_id {
-            return Ok(None);
-        }
+        // `parse_child` answers with the parent's FIRST output at the collateral puzzle hash, which
+        // is the wrong one whenever a spend created more than one. That is not hypothetical: a
+        // consumer batching several advertisements into one transaction produces exactly this shape,
+        // and each of those coins locks its owner's $DIG. Selecting by coin id rather than by
+        // position is what keeps the later ones from vanishing while their collateral stays locked.
+        let (inner, memos) = if first.coin.coin_id() == coin_id {
+            (first, first_memos)
+        } else {
+            let Some(sibling) =
+                sibling_child(&mut allocator, &first, parent_puzzle, solution_ptr, coin_id)?
+            else {
+                return Ok(None);
+            };
+            sibling
+        };
 
         if inner.asset_id != Some(DIG_ASSET_ID) {
             return Err(MirrorError::NotDigCollateral {
@@ -155,6 +168,52 @@ impl MirrorCoin {
     pub(crate) fn inner(&self) -> &P2ParentCoin {
         &self.inner
     }
+}
+
+/// Finds a LATER collateral output of the same parent spend — the one whose coin id is `coin_id`.
+///
+/// Reached only when the parent created more than one collateral coin and the caller asked about a
+/// coin other than the first. Everything that authenticates the coin — the asset id, the lineage
+/// proof, the collateral puzzle hash — is taken from `first`, the child the canonical
+/// [`P2ParentCoin::parse_child`] already derived, so this function decides *which output* and
+/// nothing else. Re-deriving those values here would be a second copy of upstream's CAT-argument
+/// handling, free to drift from it.
+///
+/// Returns `Ok(None)` when no output of this spend has that coin id, which is the honest answer to
+/// "did this spend create that coin": no.
+fn sibling_child(
+    allocator: &mut Allocator,
+    first: &P2ParentCoin,
+    parent_puzzle: Puzzle,
+    parent_solution: NodePtr,
+    coin_id: Bytes32,
+) -> Result<Option<(P2ParentCoin, Memos)>, MirrorError> {
+    let collateral_puzzle_hash = first.coin.puzzle_hash;
+    let parent_id = first.coin.parent_coin_info;
+
+    let output = run_puzzle(allocator, parent_puzzle.ptr(), parent_solution)
+        .map_err(|error| MirrorError::Malformed(format!("parent puzzle did not run: {error}")))?;
+    let conditions = Conditions::<NodePtr>::from_clvm(allocator, output)
+        .map_err(|error| MirrorError::Malformed(format!("undecodable conditions: {error}")))?;
+
+    for condition in conditions {
+        let Condition::CreateCoin(created) = condition else {
+            continue;
+        };
+        if created.puzzle_hash != collateral_puzzle_hash {
+            continue;
+        }
+
+        let sibling = Coin::new(parent_id, collateral_puzzle_hash, created.amount);
+        if sibling.coin_id() == coin_id {
+            return Ok(Some((
+                P2ParentCoin::new(sibling, first.asset_id, first.proof),
+                created.memos,
+            )));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Splits a mirror coin's memos into its namespace value and its advertised URLs.

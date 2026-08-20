@@ -21,7 +21,8 @@ use clvmr::Allocator;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_mirror_coin::{
     create, discover, list, mirror_coin_puzzle_hash, morph_store_launcher_id,
-    query::MirrorChainSource, reclaim, MirrorAdvertisement, MirrorError, DIG_ASSET_ID,
+    query::MirrorChainSource, reclaim, MirrorAdvertisement, MirrorError, SkipReason, DIG_ASSET_ID,
+    MAX_CANDIDATES,
 };
 use num_bigint::BigInt;
 
@@ -246,6 +247,22 @@ impl MirrorChainSource for FakeChain {
     }
 }
 
+/// A chain holding `count` dust coins at the shared mirror puzzle hash, all hinted to store A and
+/// none of them resolvable — what a deliberate flood looks like to either query.
+fn flooded_chain(count: usize) -> FakeChain {
+    let mut chain = FakeChain::default();
+    let hint = morph_store_launcher_id(store_a(), &epoch());
+
+    for index in 0..count {
+        let mut parent = [0u8; 32];
+        parent[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        let dust = Coin::new(Bytes32::new(parent), mirror_coin_puzzle_hash(), 1);
+        chain.publish_without_creating_spend(dust, hint);
+    }
+
+    chain
+}
+
 /// Publishes an honest mirror for `store`, owned by `owner`, and returns its coin.
 fn publish_mirror(chain: &mut FakeChain, owner: &Wallet, store: Bytes32, url: &str) -> Coin {
     let (spend, coin) = creating_spend(owner, &mirror_memos(store, &[url]));
@@ -388,11 +405,16 @@ fn list_reports_no_coins_for_an_owner_who_has_locked_nothing() {
     assert!(owned.coins().is_empty());
 }
 
-/// `list` is an inventory of the caller's own money, so an unauthenticatable candidate is fatal
-/// rather than skipped — the honest coin in this fixture is what makes the two behaviours
-/// distinguishable, since a skipping implementation would return it and look correct.
+/// `list` is an inventory of the caller's own money, so it MUST NOT be quietly short — but it also
+/// MUST NOT be deniable by a coin the caller does not own.
+///
+/// It resolves both by *disclosing*: the honest coin is returned, and the candidate that could not
+/// be resolved is named, with its reason, so a caller that would rather refuse than under-report can
+/// fail closed on `is_complete()` itself. The honest coin in this fixture is what makes the
+/// behaviours distinguishable — a silently-dropping implementation returns exactly the same coins
+/// and is caught only by the disclosure assertions below.
 #[test]
-fn list_fails_closed_when_a_candidate_cannot_be_authenticated() {
+fn list_discloses_a_candidate_it_could_not_authenticate_rather_than_dropping_or_denying() {
     let mine = wallet(1);
     let mut chain = FakeChain::default();
     publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
@@ -404,10 +426,82 @@ fn list_fails_closed_when_a_candidate_cannot_be_authenticated() {
     );
     chain.publish_without_creating_spend(orphan, morph_store_launcher_id(store_a(), &epoch()));
 
-    let error = list(&chain, mine.puzzle_hash)
-        .expect_err("an inventory that cannot see every coin must not pretend otherwise");
+    let inventory = list(&chain, mine.puzzle_hash)
+        .expect("one unresolvable candidate must not deny the whole inventory");
 
-    assert!(matches!(error, MirrorError::Unauthenticated { .. }));
+    assert_eq!(inventory.coins().len(), 1);
+    assert!(
+        !inventory.is_complete(),
+        "an inventory that could not see every candidate must not claim to be whole"
+    );
+    assert_eq!(inventory.skipped().len(), 1);
+    assert_eq!(inventory.skipped()[0].coin_id(), orphan.coin_id());
+    assert_eq!(inventory.skipped()[0].reason(), &SkipReason::Unauthenticated);
+}
+
+/// The reason a caller is given distinguishes *the source did not have it* from *nobody could read
+/// it*, because only the first is worth retrying against a better source.
+#[test]
+fn an_undecodable_candidate_is_disclosed_as_undecodable_not_as_unauthenticated() {
+    let mine = wallet(1);
+    let stranger = wallet(9);
+    let mut chain = FakeChain::default();
+    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+
+    let (spend, junk) = creating_spend_of_children(&stranger, DIG_ASSET_ID, 1, |ctx| {
+        let improper = ctx
+            .alloc(&(Bytes::new(vec![0xAA]), Bytes::new(vec![0xBB])))
+            .unwrap();
+        vec![(1, Memos::Some(improper))]
+    });
+    chain.publish(spend, junk[0], morph_store_launcher_id(store_a(), &epoch()));
+
+    let inventory = list(&chain, mine.puzzle_hash).expect("the source answered");
+
+    assert_eq!(inventory.skipped().len(), 1);
+    assert!(matches!(
+        inventory.skipped()[0].reason(),
+        SkipReason::Undecodable(_)
+    ));
+}
+
+/// An inventory that resolved every candidate says so, or `is_complete` would be a constant.
+#[test]
+fn an_inventory_that_resolved_every_candidate_reports_itself_complete() {
+    let mine = wallet(1);
+    let theirs = wallet(2);
+    let mut chain = FakeChain::default();
+    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+    publish_mirror(&mut chain, &theirs, store_a(), "https://theirs.example");
+
+    let inventory = list(&chain, mine.puzzle_hash).expect("the source answered");
+
+    assert!(inventory.is_complete());
+    assert!(inventory.skipped().is_empty());
+    assert!(!inventory.is_truncated());
+}
+
+/// A source that cannot answer at all is still an `Err`, and is NOT reported as a skipped candidate.
+///
+/// This is the line the disclosure must not blur: "one coin on the chain is odd" and "the chain did
+/// not answer" are different facts, and only the first may leave the query successful. The honest
+/// mirror beside the failing read is what distinguishes the correct `Err` from a plausible-looking
+/// `Ok` holding one claim.
+#[test]
+fn list_propagates_an_unreachable_source_rather_than_recording_it_as_a_skip() {
+    let mine = wallet(1);
+    let stranger = wallet(2);
+    let mut chain = FakeChain::default();
+    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+
+    let (_spend, unreadable) = creating_spend(&stranger, &mirror_memos(store_a(), &["https://x"]));
+    chain.publish_without_creating_spend(unreadable, morph_store_launcher_id(store_a(), &epoch()));
+    chain.spend_read_fails_for = Some(unreadable.parent_coin_info);
+
+    let error = list(&chain, mine.puzzle_hash)
+        .expect_err("a source that could not answer is not a partial answer");
+
+    assert!(matches!(error, MirrorError::ChainUnavailable(_)));
 }
 
 /// One stranger's one-mojo coin MUST NOT be able to deny every user their own inventory.
@@ -486,6 +580,55 @@ fn both_mirror_coins_created_by_one_parent_spend_are_found() {
     let found = discover(&chain, store_a(), &epoch()).expect("the source answered");
     assert_eq!(found.claims().len(), 2);
     assert_eq!(found.rejected_candidates(), 0);
+}
+
+/// The candidate bound is pinned from BOTH sides: at exactly the limit the scan completes, one
+/// candidate over it the scan stops early and says so.
+///
+/// A bound asserted only from below can only confirm itself — every count under the limit produces
+/// the same untruncated result whatever the limit actually is.
+#[test]
+fn the_candidate_bound_stops_a_scan_only_once_it_is_exceeded() {
+    let mine = wallet(1);
+
+    let at_limit = list(&flooded_chain(MAX_CANDIDATES), mine.puzzle_hash)
+        .expect("a flood must not deny the query");
+    assert!(
+        !at_limit.is_truncated(),
+        "a scan of exactly MAX_CANDIDATES candidates reaches the end of the list"
+    );
+    assert_eq!(at_limit.skipped().len(), MAX_CANDIDATES);
+
+    let over_limit = list(&flooded_chain(MAX_CANDIDATES + 1), mine.puzzle_hash)
+        .expect("a flood must not deny the query");
+    assert!(
+        over_limit.is_truncated(),
+        "one candidate past the limit must stop the scan and be disclosed"
+    );
+    assert_eq!(
+        over_limit.skipped().len(),
+        MAX_CANDIDATES,
+        "the work done is bounded by the limit, not by what the attacker supplied"
+    );
+}
+
+/// `discover` walks a list anyone may add to, so it carries the same bound — and, being the verb
+/// whose empty answer is read as *nobody mirrors this*, it MUST disclose when that answer is partial.
+#[test]
+fn a_flood_bounds_discovery_and_is_disclosed_rather_than_answered_as_nobody() {
+    let over_limit = discover(&flooded_chain(MAX_CANDIDATES + 1), store_a(), &epoch())
+        .expect("a flood must not deny the query");
+
+    assert!(over_limit.is_empty());
+    assert!(
+        over_limit.is_truncated(),
+        "an empty claim set from a truncated scan must not be readable as 'nobody mirrors this'"
+    );
+    assert_eq!(over_limit.rejected_candidates(), MAX_CANDIDATES);
+
+    let at_limit = discover(&flooded_chain(MAX_CANDIDATES), store_a(), &epoch())
+        .expect("a flood must not deny the query");
+    assert!(!at_limit.is_truncated());
 }
 
 /// A sibling collateral coin shares the mirror puzzle hash but advertises no URLs, so it is not a
