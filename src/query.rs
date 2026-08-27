@@ -275,7 +275,7 @@ pub fn list<S: ChainSource>(
         // unresolved candidate is recorded, and the caller is told.
         match authenticate(source, &candidate) {
             Ok(Candidate::Mirror(mirror)) if mirror.owner_puzzle_hash() == owner_puzzle_hash => {
-                coins.push(mirror);
+                coins.push(*mirror);
             }
 
             // Settled questions with the answer "not yours": somebody else's mirror coin, a coin at
@@ -358,7 +358,7 @@ pub fn discover<S: MirrorChainSource>(
             Ok(Candidate::Mirror(mirror))
                 if mirror.advertises(store_launcher_id, root_hash, epoch) =>
             {
-                claims.push(mirror)
+                claims.push(*mirror)
             }
             Ok(_) => rejected += 1,
             Err(MirrorError::ChainUnavailable(reason)) => {

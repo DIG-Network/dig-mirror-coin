@@ -190,7 +190,7 @@ impl MirrorCoin {
         coin_id: Bytes32,
     ) -> Result<Option<Self>, MirrorError> {
         match Self::classify(creating_spend, coin_id)? {
-            Candidate::Mirror(mirror) => Ok(Some(mirror)),
+            Candidate::Mirror(mirror) => Ok(Some(*mirror)),
             Candidate::NotAMirror => Ok(None),
             Candidate::UndecodableMemos { detail, .. } => Err(MirrorError::Malformed(detail)),
         }
@@ -271,12 +271,12 @@ impl MirrorCoin {
             return Ok(Candidate::NotAMirror);
         };
 
-        Ok(Candidate::Mirror(Self {
+        Ok(Candidate::Mirror(Box::new(Self {
             inner,
             namespace_hint,
             declared,
             urls,
-        }))
+        })))
     }
 
     /// The authenticated p2-parent view, for the spend builders.
@@ -292,7 +292,11 @@ impl MirrorCoin {
 /// answers and one is a genuine gap in knowledge.
 pub(crate) enum Candidate {
     /// A mirror coin, fully re-derived from executed on-chain code.
-    Mirror(MirrorCoin),
+    ///
+    /// Boxed because it is far larger than the other two variants, and both queries build one of
+    /// these per candidate across a list bounded only by [`MAX_CANDIDATES`](crate::MAX_CANDIDATES) —
+    /// so the unboxed enum would size every rejected candidate at the cost of an accepted one.
+    Mirror(Box<MirrorCoin>),
 
     /// Settled as not a mirror coin: the spend created no such output, the output is a different
     /// coin, or the memos decoded cleanly and carried no advertised URLs.
