@@ -26,6 +26,13 @@ The operation that returns locked collateral to its owner is named **reclaim**. 
    id around the collateral puzzle. An implementation MUST derive it through the canonical CAT
    construction (`CatArgs::curry_tree_hash`), MUST NOT derive it by hand, and MUST NOT infer the
    asset from a hint.
+
+   As of the chia-wallet-sdk 0.36 line that value is
+   `f2ed90e749738d6167bc51470572af94695f98dc51d6ee09673aafdd54601e9d`. It is stated here because it
+   is **derived, not chosen**: it depends on upstream puzzle bytes, and it changed once already when
+   `chia-sdk-types` replaced `DEFAULT_CAT_MAKER_PUZZLE` between 0.30 and 0.36 (it was
+   `e991be5f…` on the 0.30 line). An implementation MUST re-derive it rather than copy it, and MUST
+   treat a change in this value as a wire-breaking event.
 2. **A hint is not an asset, and not an owner.** Hints are unauthenticated `CREATE_COIN` memos over
    arbitrary 32-byte values. Anyone may place a coin under anyone's hint for the price of a dust
    coin, so a hint MUST NOT be treated as evidence of ownership, of asset identity, or of which
