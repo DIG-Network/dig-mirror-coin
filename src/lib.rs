@@ -73,7 +73,7 @@ pub use asset::{mirror_coin_puzzle_hash, DIG_ASSET_ID};
 pub use coin::MirrorCoin;
 pub use create::{create, MirrorAdvertisement};
 pub use error::MirrorError;
-pub use namespace::{morph_store_launcher_id, MIRROR_NAMESPACE};
+pub use namespace::{mirror_hint, MIRROR_NAMESPACE};
 pub use query::{
     discover, list, MirrorChainSource, MirrorInventory, MirrorSet, SkipReason, SkippedCandidate,
     MAX_CANDIDATES,
