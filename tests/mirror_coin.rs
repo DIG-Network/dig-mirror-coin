@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 
-use chia_bls::{PublicKey, SecretKey};
 use chia_protocol::{Bytes, Bytes32, Coin, CoinSpend};
 use chia_puzzle_types::{cat::CatArgs, LineageProof, Memos};
 use chia_sdk_driver::{Cat, CatInfo, Puzzle};
@@ -26,7 +25,6 @@ use num_bigint::BigInt;
 mod support;
 
 use support::*;
-
 
 /// A chain that answers exactly what a test puts in it, and fails exactly where a test says.
 #[derive(Default)]

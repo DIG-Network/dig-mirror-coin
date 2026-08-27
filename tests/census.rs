@@ -196,7 +196,9 @@ fn take_final(outcome: CensusOutcome) -> MirrorCensus {
         CensusOutcome::Pending {
             census_height,
             peak_height,
-        } => panic!("expected a final census; got Pending at {census_height} with peak {peak_height}"),
+        } => panic!(
+            "expected a final census; got Pending at {census_height} with peak {peak_height}"
+        ),
     }
 }
 
@@ -267,7 +269,8 @@ fn a_non_transaction_block_is_never_chosen_as_the_census_height() {
 
 #[test]
 fn an_epoch_the_chain_has_not_reached_is_an_answer_and_not_an_error() {
-    let found = census_height(&sparse_chain(), 9_999).expect("this is a real answer, not a failure");
+    let found =
+        census_height(&sparse_chain(), 9_999).expect("this is a real answer, not a failure");
 
     assert!(found.is_none());
 }
@@ -289,7 +292,8 @@ fn a_source_exposing_no_peak_cannot_establish_a_census_height() {
     let mut chain = sparse_chain();
     chain.peak = None;
 
-    let error = census_height(&chain, 1_000).expect_err("without a peak there is nothing to search");
+    let error =
+        census_height(&chain, 1_000).expect_err("without a peak there is nothing to search");
 
     assert!(matches!(error, MirrorError::ChainUnavailable(_)));
 }
@@ -332,11 +336,21 @@ fn a_census_exactly_at_the_finality_depth_is_final() {
 #[test]
 fn a_qualifying_coin_is_one_store_one_owner_and_its_full_amount_locked() {
     let mut chain = CensusChain::new();
-    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), ABOVE_REQUIREMENT);
+    publish_qualifying(
+        &mut chain,
+        &wallet(1),
+        store_a(),
+        root_1(),
+        ABOVE_REQUIREMENT,
+    );
 
     let census = run(&chain);
 
-    assert_eq!(census.census().epoch, 43, "the census describes the epoch AFTER the record it qualified against");
+    assert_eq!(
+        census.census().epoch,
+        43,
+        "the census describes the epoch AFTER the record it qualified against"
+    );
     assert_eq!(census.census().stores, 1);
     assert_eq!(census.census().owners, 1);
     assert_eq!(census.census().locked, ABOVE_REQUIREMENT);
@@ -351,8 +365,16 @@ fn one_owner_advertising_two_roots_of_one_store_is_two_stores_and_one_owner() {
 
     let census = run(&chain);
 
-    assert_eq!(census.census().stores, 2, "each root is paid for in full and counts in full");
-    assert_eq!(census.census().owners, 1, "one owner hash, however many advertisements");
+    assert_eq!(
+        census.census().stores,
+        2,
+        "each root is paid for in full and counts in full"
+    );
+    assert_eq!(
+        census.census().owners,
+        1,
+        "one owner hash, however many advertisements"
+    );
     assert_eq!(census.census().locked, AT_REQUIREMENT + ABOVE_REQUIREMENT);
 }
 
@@ -410,13 +432,27 @@ fn the_larger_coin_wins_a_triple_whichever_order_the_chain_returns_them_in() {
 fn a_coin_below_the_requirement_contributes_to_nothing_while_an_honest_one_still_counts() {
     let mut chain = CensusChain::new();
     publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
-    publish_qualifying(&mut chain, &wallet(2), store_b(), root_1(), BELOW_REQUIREMENT);
+    publish_qualifying(
+        &mut chain,
+        &wallet(2),
+        store_b(),
+        root_1(),
+        BELOW_REQUIREMENT,
+    );
 
     let census = run(&chain);
 
     assert_eq!(census.census().stores, 1, "the dust coin is not a store");
-    assert_eq!(census.census().owners, 1, "and its owner is not a collateralised owner");
-    assert_eq!(census.census().locked, AT_REQUIREMENT, "and its mojos are not locked collateral");
+    assert_eq!(
+        census.census().owners,
+        1,
+        "and its owner is not a collateralised owner"
+    );
+    assert_eq!(
+        census.census().locked,
+        AT_REQUIREMENT,
+        "and its mojos are not locked collateral"
+    );
     assert_eq!(census.excluded().under_collateralised, 1);
 }
 
@@ -437,11 +473,23 @@ fn a_coin_exactly_at_the_requirement_qualifies() {
 #[test]
 fn flooding_dust_coins_moves_none_of_the_three_outputs() {
     let mut honest_only = CensusChain::new();
-    publish_qualifying(&mut honest_only, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+    publish_qualifying(
+        &mut honest_only,
+        &wallet(1),
+        store_a(),
+        root_1(),
+        AT_REQUIREMENT,
+    );
     let baseline = run(&honest_only).census();
 
     let mut flooded = CensusChain::new();
-    publish_qualifying(&mut flooded, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+    publish_qualifying(
+        &mut flooded,
+        &wallet(1),
+        store_a(),
+        root_1(),
+        AT_REQUIREMENT,
+    );
     for seed in 10..40u8 {
         publish_qualifying(
             &mut flooded,
@@ -525,7 +573,12 @@ fn a_coin_the_source_cannot_place_in_time_is_excluded_rather_than_assumed() {
     let mut chain = CensusChain::new();
     publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
 
-    let memos = mirror_memos(&wallet(2), store_b(), root_1(), &["https://undated.example"]);
+    let memos = mirror_memos(
+        &wallet(2),
+        store_b(),
+        root_1(),
+        &["https://undated.example"],
+    );
     let (spend, coin) = creating_spend_of_amount(&wallet(2), &memos, ABOVE_REQUIREMENT);
     chain.coins.push(CoinRecord {
         coin,
@@ -566,7 +619,11 @@ fn a_coin_declaring_a_different_epoch_is_excluded_from_all_three_outputs() {
     let census = run(&chain);
 
     assert_eq!(census.census().stores, 1);
-    assert_eq!(census.census().locked, AT_REQUIREMENT, "a stale coin's collateral is not this epoch's");
+    assert_eq!(
+        census.census().locked,
+        AT_REQUIREMENT,
+        "a stale coin's collateral is not this epoch's"
+    );
     assert_eq!(census.excluded().wrong_epoch, 1);
 }
 
@@ -622,7 +679,11 @@ fn a_coin_whose_declaration_does_not_reproduce_its_hint_is_excluded() {
     let census = run(&chain);
 
     assert_eq!(census.census().stores, 1);
-    assert_eq!(census.census().owners, 1, "an unattributable coin never becomes an owner");
+    assert_eq!(
+        census.census().owners,
+        1,
+        "an unattributable coin never becomes an owner"
+    );
     assert_eq!(census.excluded().unattributed, 1);
 }
 
@@ -637,7 +698,12 @@ fn attribution_follows_the_lineage_proof_and_not_the_declaration() {
     publish_qualifying(&mut chain, &real, store_a(), root_1(), AT_REQUIREMENT);
 
     // Declared consistently, so the hint check passes — the only question left is WHOSE coin it is.
-    let memos = mirror_memos(&real, stranger.puzzle_hash, root_2(), &["https://claimed.example"]);
+    let memos = mirror_memos(
+        &real,
+        stranger.puzzle_hash,
+        root_2(),
+        &["https://claimed.example"],
+    );
     let (spend, coin) = creating_spend_of_amount(&real, &memos, ABOVE_REQUIREMENT);
     chain.publish(spend, coin, CENSUS_AT - 10, None);
 
@@ -737,14 +803,24 @@ fn a_census_advances_the_record_it_was_qualified_against() {
 #[test]
 fn an_epoch_with_no_qualifying_coins_censuses_as_zero() {
     let mut chain = CensusChain::new();
-    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), BELOW_REQUIREMENT);
+    publish_qualifying(
+        &mut chain,
+        &wallet(1),
+        store_a(),
+        root_1(),
+        BELOW_REQUIREMENT,
+    );
 
     let census = run(&chain);
 
     assert_eq!(census.census().stores, 0);
     assert_eq!(census.census().owners, 0);
     assert_eq!(census.census().locked, 0);
-    assert_eq!(census.examined(), 1, "examined counts what was looked at, not what qualified");
+    assert_eq!(
+        census.examined(),
+        1,
+        "examined counts what was looked at, not what qualified"
+    );
 }
 
 #[test]
@@ -756,5 +832,9 @@ fn a_bigint_epoch_is_compared_against_the_records_epoch_and_not_its_length() {
     publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
 
     assert_eq!(run(&chain).census().stores, 1);
-    assert_eq!(epoch(), BigInt::from(42), "the fixture epoch is the record's epoch");
+    assert_eq!(
+        epoch(),
+        BigInt::from(42),
+        "the fixture epoch is the record's epoch"
+    );
 }

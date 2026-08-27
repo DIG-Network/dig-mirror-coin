@@ -194,10 +194,9 @@ pub fn census_height<S: ChainSource>(
     source: &S,
     epoch_start_unix_secs: u64,
 ) -> Result<Option<CensusHeight>, MirrorError> {
-    let peak = source
-        .peak_height()
-        .map_err(unavailable)?
-        .ok_or_else(|| MirrorError::ChainUnavailable("source exposes no peak height".to_string()))?;
+    let peak = source.peak_height().map_err(unavailable)?.ok_or_else(|| {
+        MirrorError::ChainUnavailable("source exposes no peak height".to_string())
+    })?;
 
     // The epoch has not begun on chain yet. Not an error: the ordinary state of a future epoch.
     if timestamp_at_or_below(source, peak)?
@@ -274,10 +273,9 @@ pub fn census<S: ChainSource>(
         MirrorError::Malformed("the terminal epoch has no successor to census".to_string())
     })?;
 
-    let peak = source
-        .peak_height()
-        .map_err(unavailable)?
-        .ok_or_else(|| MirrorError::ChainUnavailable("source exposes no peak height".to_string()))?;
+    let peak = source.peak_height().map_err(unavailable)?.ok_or_else(|| {
+        MirrorError::ChainUnavailable("source exposes no peak height".to_string())
+    })?;
 
     // Saturating, because a census height near `u32::MAX` must read as "not yet final" rather than
     // wrapping to a small number that every peak trivially exceeds.
@@ -417,7 +415,10 @@ fn qualify<S: ChainSource>(
 
     // C3 — not spent at or before the census height. A coin spent AFTER it was locked at the height
     // being counted and still qualifies.
-    if candidate.spent_height.is_some_and(|spent| spent <= census_height) {
+    if candidate
+        .spent_height
+        .is_some_and(|spent| spent <= census_height)
+    {
         excluded.spent_by_census_height += 1;
         return Ok(None);
     }
@@ -469,4 +470,49 @@ fn qualify<S: ChainSource>(
             coin_id: coin.coin().coin_id(),
         },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selection(amount: u64, first_byte: u8) -> Selection {
+        let mut id = [0u8; 32];
+        id[0] = first_byte;
+        Selection {
+            amount,
+            coin_id: Bytes32::new(id),
+        }
+    }
+
+    /// The amount axis. Exercised by the census tests too, pinned here so the tie-break test below
+    /// has a control that is failing for a different reason than it is.
+    #[test]
+    fn a_larger_coin_displaces_a_smaller_one() {
+        assert!(selection(2_000, 0x01).supersedes(&selection(1_000, 0x00)));
+        assert!(!selection(1_000, 0x00).supersedes(&selection(2_000, 0x01)));
+    }
+
+    /// The tie-break axis, which no census fixture can reach: two coins of equal amount for one
+    /// triple would need identical creating spends to differ only in coin id.
+    ///
+    /// Determinism here is not cosmetic. Two nodes that broke a tie differently would attribute a
+    /// different amount to the same triple and compute a different `locked` from the same chain.
+    #[test]
+    fn an_equal_tie_is_broken_by_the_lower_coin_id_compared_big_endian_bytewise() {
+        let low = selection(1_000, 0x01);
+        let high = selection(1_000, 0x02);
+
+        assert!(low.supersedes(&high));
+        assert!(!high.supersedes(&low));
+    }
+
+    /// A coin never displaces itself, so a duplicate record for one coin cannot flip the selection
+    /// back and forth depending on the order a source returns it in.
+    #[test]
+    fn a_coin_does_not_displace_itself() {
+        let only = selection(1_000, 0x01);
+
+        assert!(!only.supersedes(&only));
+    }
 }
