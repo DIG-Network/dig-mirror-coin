@@ -145,8 +145,14 @@ fn every_term_reaches_the_hash() {
     let moved_owner = mirror_hint(store(), root(), Bytes32::new([0x34; 32]), &epoch);
     let moved_epoch = mirror_hint(store(), root(), owner(), &BigInt::from(4));
 
-    assert_ne!(base, moved_store, "the store launcher id must reach the hash");
+    assert_ne!(
+        base, moved_store,
+        "the store launcher id must reach the hash"
+    );
     assert_ne!(base, moved_root, "the root must reach the hash");
-    assert_ne!(base, moved_owner, "the owner puzzle hash must reach the hash");
+    assert_ne!(
+        base, moved_owner,
+        "the owner puzzle hash must reach the hash"
+    );
     assert_ne!(base, moved_epoch, "the epoch must reach the hash");
 }
