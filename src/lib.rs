@@ -74,6 +74,7 @@
 #![warn(missing_docs)]
 
 mod asset;
+pub mod census;
 mod coin;
 mod create;
 mod error;
@@ -82,6 +83,7 @@ pub mod query;
 mod reclaim;
 
 pub use asset::{mirror_coin_puzzle_hash, DIG_ASSET_ID};
+pub use census::{census, census_height, CensusHeight, CensusOutcome, Exclusions, MirrorCensus};
 pub use coin::MirrorCoin;
 pub use create::{create, MirrorAdvertisement};
 pub use error::MirrorError;

@@ -397,7 +397,7 @@ pub fn discover<S: MirrorChainSource>(
 /// `Option` so that a coin whose memos would not decode still reports the owner it DID establish;
 /// `Err(MirrorError::Unauthenticated)` means the creating spend is missing, so nothing about the
 /// coin could be established at all — the one case where even the owner is unknown.
-fn authenticate<S: ChainSource>(
+pub(crate) fn authenticate<S: ChainSource>(
     source: &S,
     candidate: &CoinRecord,
 ) -> Result<Candidate, MirrorError> {
@@ -423,6 +423,6 @@ fn skip_reason(error: MirrorError) -> SkipReason {
 }
 
 /// Maps a chain source's own error into the crate's single "could not establish" variant.
-fn unavailable<E: core::fmt::Display>(error: E) -> MirrorError {
+pub(crate) fn unavailable<E: core::fmt::Display>(error: E) -> MirrorError {
     MirrorError::ChainUnavailable(error.to_string())
 }
