@@ -7,6 +7,19 @@
 //! property that matters — which asset is locked, how much, and who controls it — is read from the
 //! coin's **creating spend**: the parent's actual puzzle reveal and solution, run to produce its
 //! conditions. A coin that cannot be reconstructed that way is not accepted at all.
+//!
+//! ## The memos are a declaration, and that is exactly why they are read
+//!
+//! One thing genuinely does come from the memos: **which advertisement the collateral is staked
+//! on** — the store, the root and the epoch. That is not a weakening of the rule above, it is the
+//! only place such a claim can live. Whoever locks the $DIG chooses what to stake it on, so the
+//! declaration is theirs to make; what matters is that they can make **one**, and that a verifier
+//! compares it against what it asked about instead of assuming.
+//!
+//! The alternative — inferring the advertisement by recomputing the hint — cannot work, and the
+//! reason is written out on [`mirror_hint`]: the epoch is an unbounded free term, so its author can
+//! solve for a value that lands a coin bonding their own store on anyone else's hint. Under that
+//! construction one stake would back unlimited claims. The declaration is what pins it to one.
 
 use chia_protocol::{Bytes, Bytes32, Coin, CoinSpend};
 use chia_puzzle_types::{LineageProof, Memos};
@@ -18,7 +31,7 @@ use num_bigint::BigInt;
 
 use crate::asset::DIG_ASSET_ID;
 use crate::error::MirrorError;
-use crate::namespace::morph_store_launcher_id;
+use crate::namespace::mirror_hint;
 
 /// A coin locking $DIG as collateral behind a claim to mirror a DIG store.
 ///
@@ -33,7 +46,21 @@ use crate::namespace::morph_store_launcher_id;
 pub struct MirrorCoin {
     inner: P2ParentCoin,
     namespace_hint: Bytes32,
+    declared: Advertised,
     urls: Vec<String>,
+}
+
+/// The advertisement a mirror coin declares in its memos: which store, at which root, for which
+/// epoch.
+///
+/// Held as one value rather than three loose fields because the three are only ever meaningful
+/// together — a coin bonds a *tuple*, and comparing two of the three is the shape of the bug this
+/// crate exists to make impossible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Advertised {
+    store_launcher_id: Bytes32,
+    root_hash: Bytes32,
+    epoch: BigInt,
 }
 
 impl MirrorCoin {
@@ -62,11 +89,75 @@ impl MirrorCoin {
 
     /// The namespace value this coin is advertised under.
     ///
-    /// This is a one-way morph of a store launcher id and an epoch, so it names no store on its own.
-    /// To learn whether this coin advertises a particular store, use
-    /// [`advertises`](Self::advertises), which recomputes the morph and compares.
+    /// This is a one-way morph of all four advertised terms, so it names no store on its own. To
+    /// learn whether this coin advertises a particular store and root, use
+    /// [`advertises`](Self::advertises).
     pub fn namespace_hint(&self) -> Bytes32 {
         self.namespace_hint
+    }
+
+    /// The store this coin **declares** it mirrors.
+    ///
+    /// Read from the coin's memos, which is where the declaration belongs — see the module docs.
+    /// A caller checking a coin it was handed by a stranger wants [`advertises`](Self::advertises),
+    /// which compares this against what the caller actually asked about. This accessor is for the
+    /// caller that already trusts the coin is theirs and simply wants to know what it bonds, which
+    /// is the ordinary case after [`list`](crate::list).
+    pub fn store_launcher_id(&self) -> Bytes32 {
+        self.declared.store_launcher_id
+    }
+
+    /// The store root this coin declares it mirrors.
+    ///
+    /// A mirror bonds one root, not a store as a whole: this is the value that lets an owner match
+    /// a coin against the `.dig` files actually on disk, and reclaim the ones that no longer are.
+    pub fn root_hash(&self) -> Bytes32 {
+        self.declared.root_hash
+    }
+
+    /// The epoch this coin declares it advertises for.
+    pub fn epoch(&self) -> &BigInt {
+        &self.declared.epoch
+    }
+
+    /// Whether this coin advertises `store_launcher_id` at `root_hash` for `epoch`.
+    ///
+    /// This is the sound test, and the only one. It makes **two** comparisons, and neither is
+    /// redundant:
+    ///
+    /// 1. the coin's declared tuple equals the tuple asked about — which is what binds this
+    ///    collateral to this advertisement and nothing else; and
+    /// 2. the coin's hint equals the hint that tuple morphs to, using the owner taken from the
+    ///    coin's own **lineage proof** rather than from any memo — which is what says the coin was
+    ///    really published in that tuple's bucket instead of squatting in another.
+    ///
+    /// Check 1 without check 2 accepts a coin that declares one thing and is indexed as another.
+    /// Check 2 without check 1 accepts a coin bonding an entirely different store, because the
+    /// epoch term is free and its author can solve for a hint collision — see [`mirror_hint`].
+    ///
+    /// The owner is not a parameter because it does not need to be: it is recoverable from the coin
+    /// ([`owner_puzzle_hash`](Self::owner_puzzle_hash)), so a verifier holding nothing but a coin id
+    /// and a tuple can close the loop without trusting whoever handed the coin over.
+    pub fn advertises(
+        &self,
+        store_launcher_id: Bytes32,
+        root_hash: Bytes32,
+        epoch: &BigInt,
+    ) -> bool {
+        let asked = Advertised {
+            store_launcher_id,
+            root_hash,
+            epoch: epoch.clone(),
+        };
+
+        self.declared == asked
+            && self.namespace_hint
+                == mirror_hint(
+                    store_launcher_id,
+                    root_hash,
+                    self.owner_puzzle_hash(),
+                    epoch,
+                )
     }
 
     /// The URLs the owner advertises for the store, in the order they were published.
@@ -76,15 +167,6 @@ impl MirrorCoin {
     /// them.
     pub fn urls(&self) -> &[String] {
         &self.urls
-    }
-
-    /// Whether this coin advertises `store_launcher_id` for `epoch`.
-    ///
-    /// This is the sound test, and the only one: it recomputes the namespace value from a candidate
-    /// store id and compares. A caller that instead reads the store out of a memo is trusting the
-    /// coin's author.
-    pub fn advertises(&self, store_launcher_id: Bytes32, epoch: &BigInt) -> bool {
-        self.namespace_hint == morph_store_launcher_id(store_launcher_id, epoch)
     }
 
     /// Reconstructs a mirror coin from the spend that CREATED it.
@@ -108,7 +190,7 @@ impl MirrorCoin {
         coin_id: Bytes32,
     ) -> Result<Option<Self>, MirrorError> {
         match Self::classify(creating_spend, coin_id)? {
-            Candidate::Mirror(mirror) => Ok(Some(mirror)),
+            Candidate::Mirror(mirror) => Ok(Some(*mirror)),
             Candidate::NotAMirror => Ok(None),
             Candidate::UndecodableMemos { detail, .. } => Err(MirrorError::Malformed(detail)),
         }
@@ -185,15 +267,16 @@ impl MirrorCoin {
             }
         };
 
-        let Some((namespace_hint, urls)) = decoded else {
+        let Some((namespace_hint, declared, urls)) = decoded else {
             return Ok(Candidate::NotAMirror);
         };
 
-        Ok(Candidate::Mirror(Self {
+        Ok(Candidate::Mirror(Box::new(Self {
             inner,
             namespace_hint,
+            declared,
             urls,
-        }))
+        })))
     }
 
     /// The authenticated p2-parent view, for the spend builders.
@@ -209,7 +292,11 @@ impl MirrorCoin {
 /// answers and one is a genuine gap in knowledge.
 pub(crate) enum Candidate {
     /// A mirror coin, fully re-derived from executed on-chain code.
-    Mirror(MirrorCoin),
+    ///
+    /// Boxed because it is far larger than the other two variants, and both queries build one of
+    /// these per candidate across a list bounded only by [`MAX_CANDIDATES`](crate::MAX_CANDIDATES) —
+    /// so the unboxed enum would size every rejected candidate at the cost of an accepted one.
+    Mirror(Box<MirrorCoin>),
 
     /// Settled as not a mirror coin: the spend created no such output, the output is a different
     /// coin, or the memos decoded cleanly and carried no advertised URLs.
@@ -279,16 +366,29 @@ fn sibling_child(
     Ok(None)
 }
 
-/// Splits a mirror coin's memos into its namespace value and its advertised URLs.
+/// Splits a mirror coin's memos into its namespace value, its declared advertisement, and its URLs.
 ///
-/// `Ok(None)` means the memos were READ and are not mirror-shaped — absent, empty, a first entry
-/// that is not a 32-byte namespace value, or no URLs after it. `Err(detail)` means they could not be
-/// read at all. The signature keeps those apart deliberately: the first is an answer about the coin,
-/// the second is the absence of one, and every caller above needs to treat them differently.
+/// # The layout
+///
+/// ```text
+/// [ hint(32) , store(32) , root(32) , epoch(signed BE) , url , url , … ]
+/// ```
+///
+/// A fixed four-entry prefix followed by a homogeneous tail of URLs, and every prefix entry is
+/// shape-checked: the three 32-byte terms must be exactly 32 bytes or the memos are not
+/// mirror-shaped. That structure is deliberate. The ancestor layout was
+/// `[hint, peerIp, publicSyntheticKey]`, where slot 1 was a public key that any reader following the
+/// obvious rule surfaced as a bogus URL; the defence against repeating that is not care, it is a
+/// prefix whose arity is fixed and whose entries cannot be mistaken for the tail.
+///
+/// `Ok(None)` means the memos were READ and are not mirror-shaped — absent, empty, too short, a
+/// prefix entry of the wrong width, or no URLs after it. `Err(detail)` means they could not be read
+/// at all. The signature keeps those apart deliberately: the first is an answer about the coin, the
+/// second is the absence of one, and every caller above needs to treat them differently.
 fn parse_memos(
     allocator: &Allocator,
     memos: Memos,
-) -> Result<Option<(Bytes32, Vec<String>)>, String> {
+) -> Result<Option<(Bytes32, Advertised, Vec<String>)>, String> {
     let Memos::Some(node) = memos else {
         return Ok(None);
     };
@@ -296,12 +396,24 @@ fn parse_memos(
     let entries = Vec::<Bytes>::from_clvm(allocator, node)
         .map_err(|error| format!("undecodable memos: {error}"))?;
 
-    let Some((namespace, advertised)) = entries.split_first() else {
+    let Some(([namespace, store, root, epoch], advertised)) = entries.split_first_chunk::<4>()
+    else {
         return Ok(None);
     };
 
-    let Ok(namespace_hint) = Bytes32::try_from(namespace.as_ref()) else {
+    let (Ok(namespace_hint), Ok(store_launcher_id), Ok(root_hash)) = (
+        Bytes32::try_from(namespace.as_ref()),
+        Bytes32::try_from(store.as_ref()),
+        Bytes32::try_from(root.as_ref()),
+    ) else {
         return Ok(None);
+    };
+
+    let declared = Advertised {
+        store_launcher_id,
+        root_hash,
+        // An empty atom is CLVM's zero, and `from_signed_bytes_be` already reads it as such.
+        epoch: BigInt::from_signed_bytes_be(epoch.as_ref()),
     };
 
     let mut urls = Vec::with_capacity(advertised.len());
@@ -317,5 +429,5 @@ fn parse_memos(
         return Ok(None);
     }
 
-    Ok(Some((namespace_hint, urls)))
+    Ok(Some((namespace_hint, declared, urls)))
 }

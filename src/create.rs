@@ -1,8 +1,9 @@
-//! **create** — lock $DIG and publish a mirror for a store.
+//! **create** — lock $DIG and publish a mirror for one root of a store.
 //!
 //! Creation moves $DIG from the owner's ordinary CAT coins into the collateral puzzle, carrying the
-//! store's namespace value and the advertised URLs as memos. The resulting coin is spendable again
-//! only by [`reclaim`](crate::reclaim), and only by the wallet that created it.
+//! namespace value, the advertisement the coin bonds, and the advertised URLs as memos. The
+//! resulting coin is spendable again only by [`reclaim`](crate::reclaim), and only by the wallet
+//! that created it.
 
 use chia_bls::PublicKey;
 use chia_protocol::{Bytes, Bytes32, Coin, CoinSpend};
@@ -14,17 +15,24 @@ use num_bigint::BigInt;
 
 use crate::asset::{mirror_coin_inner_puzzle_hash, DIG_ASSET_ID};
 use crate::error::MirrorError;
-use crate::namespace::morph_store_launcher_id;
+use crate::namespace::mirror_hint;
 
 /// What a mirror advertises, and what it stakes on the claim.
 ///
-/// Grouped into one type rather than spread across a long parameter list, because these four values
-/// are the advertisement — they belong together, and a caller who transposes two positional
-/// arguments in a money-moving call should not be able to.
+/// Grouped into one type rather than spread across a long parameter list, because these values are
+/// the advertisement — they belong together, and a caller who transposes two positional arguments in
+/// a money-moving call should not be able to. With `store_launcher_id` and `root_hash` sitting
+/// side by side and sharing a type, that stops being a style preference.
 #[derive(Debug, Clone)]
 pub struct MirrorAdvertisement {
     /// The store being advertised.
     pub store_launcher_id: Bytes32,
+    /// The **root of that store** being advertised.
+    ///
+    /// A mirror bonds one root, not a store as a whole. That is what lets a publisher fund the
+    /// latest root and decline the ones before it, and it is what makes a node's mirror coin
+    /// correspond to a `.dig` file actually on its disk rather than to a store it once served.
+    pub root_hash: Bytes32,
     /// The epoch the advertisement is published for.
     pub epoch: BigInt,
     /// Where the store can be fetched from. MUST be non-empty.
@@ -58,6 +66,7 @@ pub fn create(
 ) -> Result<Vec<CoinSpend>, MirrorError> {
     let MirrorAdvertisement {
         store_launcher_id,
+        root_hash,
         epoch,
         urls,
         collateral,
@@ -80,9 +89,19 @@ pub fn create(
 
     let mut ctx = SpendContext::new();
 
-    let namespace_hint = morph_store_launcher_id(store_launcher_id, &epoch);
-    let mut memo_entries = Vec::with_capacity(urls.len() + 1);
+    // The owner is one of the four terms the hint is morphed from, so it has to be known before the
+    // memos are built rather than at signing time.
+    let owner = StandardLayer::new(synthetic_key);
+    let owner_puzzle_hash: Bytes32 = owner.tree_hash().into();
+
+    // `[hint, store, root, epoch, url…]` — the layout `parse_memos` reads back. The coin DECLARES
+    // what it bonds, because a hint cannot: see `MirrorCoin::advertises`.
+    let namespace_hint = mirror_hint(store_launcher_id, root_hash, owner_puzzle_hash, &epoch);
+    let mut memo_entries = Vec::with_capacity(urls.len() + 4);
     memo_entries.push(Bytes::new(namespace_hint.to_vec()));
+    memo_entries.push(Bytes::new(store_launcher_id.to_vec()));
+    memo_entries.push(Bytes::new(root_hash.to_vec()));
+    memo_entries.push(Bytes::new(epoch.to_signed_bytes_be()));
     for url in &urls {
         memo_entries.push(Bytes::new(url.as_bytes().to_vec()));
     }
@@ -98,9 +117,6 @@ pub fn create(
             memos,
         ),
     ];
-
-    let owner = StandardLayer::new(synthetic_key);
-    let owner_puzzle_hash: Bytes32 = owner.tree_hash().into();
 
     let mut spends = Spends::new(owner_puzzle_hash);
     for dig_coin in dig_coins {
@@ -131,6 +147,7 @@ mod tests {
         let error = create(
             MirrorAdvertisement {
                 store_launcher_id: Bytes32::new([1u8; 32]),
+                root_hash: Bytes32::new([2u8; 32]),
                 epoch: BigInt::from(0),
                 urls: vec![],
                 collateral: 1_000,
@@ -152,6 +169,7 @@ mod tests {
         let error = create(
             MirrorAdvertisement {
                 store_launcher_id: Bytes32::new([1u8; 32]),
+                root_hash: Bytes32::new([2u8; 32]),
                 epoch: BigInt::from(0),
                 urls: vec!["https://mirror.example".to_string()],
                 collateral: 0,

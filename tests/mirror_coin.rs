@@ -20,9 +20,8 @@ use clvm_utils::{ToTreeHash, TreeHash};
 use clvmr::Allocator;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_mirror_coin::{
-    create, discover, list, mirror_coin_puzzle_hash, morph_store_launcher_id,
-    query::MirrorChainSource, reclaim, MirrorAdvertisement, MirrorError, SkipReason, DIG_ASSET_ID,
-    MAX_CANDIDATES,
+    create, discover, list, mirror_coin_puzzle_hash, mirror_hint, query::MirrorChainSource,
+    reclaim, MirrorAdvertisement, MirrorError, SkipReason, DIG_ASSET_ID, MAX_CANDIDATES,
 };
 use num_bigint::BigInt;
 
@@ -36,8 +35,23 @@ fn store_b() -> Bytes32 {
     Bytes32::new([0xB2; 32])
 }
 
+/// Two roots of the SAME store. A mirror bonds one root, so most fixtures here need a second one to
+/// be able to show that bonding the first does not bond the second.
+fn root_1() -> Bytes32 {
+    Bytes32::new([0xC3; 32])
+}
+
+fn root_2() -> Bytes32 {
+    Bytes32::new([0xD4; 32])
+}
+
 fn epoch() -> BigInt {
     BigInt::from(42)
+}
+
+/// The hint `owner`'s advertisement of `store` at `root` lands on, in the current epoch.
+fn hint_of(owner: &Wallet, store: Bytes32, root: Bytes32) -> Bytes32 {
+    mirror_hint(store, root, owner.puzzle_hash, &epoch())
 }
 
 /// A wallet: the key that signs, and the puzzle hash that owns.
@@ -62,6 +76,26 @@ fn wallet(seed: u8) -> Wallet {
 /// exercise the authentication path at all.
 fn creating_spend(owner: &Wallet, memo_entries: &[Bytes]) -> (CoinSpend, Coin) {
     creating_spend_of_asset(owner, memo_entries, DIG_ASSET_ID)
+}
+
+/// As [`creating_spend`], but locking `amount` rather than the default collateral.
+///
+/// The amount is the ONLY thing that distinguishes two coins of the same owner here: the fixture
+/// derives its parent deterministically from owner, asset and amount, so two spends built with
+/// identical arguments produce a coin with an identical id. A test that needs two genuinely
+/// different coins from one wallet must vary this, or the second `publish` silently overwrites the
+/// first's creating spend and both records resolve to the same coin.
+fn creating_spend_of_amount(
+    owner: &Wallet,
+    memo_entries: &[Bytes],
+    amount: u64,
+) -> (CoinSpend, Coin) {
+    let entries = memo_entries.to_vec();
+    let (spend, children) = creating_spend_of_children(owner, DIG_ASSET_ID, amount, |ctx| {
+        vec![(amount, Memos::Some(ctx.alloc(&entries).unwrap()))]
+    });
+
+    (spend, children[0])
 }
 
 /// As [`creating_spend`], but for an arbitrary CAT — so a test can present collateral that is not
@@ -137,11 +171,27 @@ fn creating_spend_of_children(
     (spend, coins)
 }
 
-/// Memos for a mirror advertising `store` in the current epoch.
-fn mirror_memos(store: Bytes32, urls: &[&str]) -> Vec<Bytes> {
-    let mut entries = vec![Bytes::new(
-        morph_store_launcher_id(store, &epoch()).to_vec(),
-    )];
+/// Memos for `owner`'s mirror advertising `store` at `root` in the current epoch — the honest
+/// `[hint, store, root, epoch, url…]` layout a real `create` emits.
+fn mirror_memos(owner: &Wallet, store: Bytes32, root: Bytes32, urls: &[&str]) -> Vec<Bytes> {
+    declared_memos(hint_of(owner, store, root), store, root, &epoch(), urls)
+}
+
+/// Memos with every field chosen independently, so a test can build a coin whose declaration and
+/// whose hint disagree — which no honest writer produces and every hostile one might.
+fn declared_memos(
+    hint: Bytes32,
+    store: Bytes32,
+    root: Bytes32,
+    epoch: &BigInt,
+    urls: &[&str],
+) -> Vec<Bytes> {
+    let mut entries = vec![
+        Bytes::new(hint.to_vec()),
+        Bytes::new(store.to_vec()),
+        Bytes::new(root.to_vec()),
+        Bytes::new(epoch.to_signed_bytes_be()),
+    ];
     entries.extend(urls.iter().map(|url| Bytes::new(url.as_bytes().to_vec())));
     entries
 }
@@ -259,20 +309,18 @@ fn publish_undecodable_coin(chain: &mut FakeChain, owner: &Wallet) -> Coin {
             .unwrap();
         vec![(1, Memos::Some(improper))]
     });
-    chain.publish(
-        spend,
-        coins[0],
-        morph_store_launcher_id(store_a(), &epoch()),
-    );
+    chain.publish(spend, coins[0], hint_of(owner, store_a(), root_1()));
 
     coins[0]
 }
 
-/// A chain holding `count` dust coins at the shared mirror puzzle hash, all hinted to store A and
+/// A chain holding `count` dust coins at the shared mirror puzzle hash, all hinted to `hint` and
 /// none of them resolvable — what a deliberate flood looks like to either query.
-fn flooded_chain(count: usize) -> FakeChain {
+///
+/// The hint is a parameter because `discover` is keyed on a full advertisement now: a flood aimed at
+/// a bucket nobody queries would prove nothing about the bound.
+fn flooded_chain(count: usize, hint: Bytes32) -> FakeChain {
     let mut chain = FakeChain::default();
-    let hint = morph_store_launcher_id(store_a(), &epoch());
 
     for index in 0..count {
         let mut parent = [0u8; 32];
@@ -284,10 +332,16 @@ fn flooded_chain(count: usize) -> FakeChain {
     chain
 }
 
-/// Publishes an honest mirror for `store`, owned by `owner`, and returns its coin.
-fn publish_mirror(chain: &mut FakeChain, owner: &Wallet, store: Bytes32, url: &str) -> Coin {
-    let (spend, coin) = creating_spend(owner, &mirror_memos(store, &[url]));
-    chain.publish(spend, coin, morph_store_launcher_id(store, &epoch()));
+/// Publishes an honest mirror for `store` at `root`, owned by `owner`, and returns its coin.
+fn publish_mirror(
+    chain: &mut FakeChain,
+    owner: &Wallet,
+    store: Bytes32,
+    root: Bytes32,
+    url: &str,
+) -> Coin {
+    let (spend, coin) = creating_spend(owner, &mirror_memos(owner, store, root, &[url]));
+    chain.publish(spend, coin, hint_of(owner, store, root));
     coin
 }
 
@@ -298,12 +352,16 @@ fn publish_mirror(chain: &mut FakeChain, owner: &Wallet, store: Bytes32, url: &s
 #[test]
 fn discover_reports_an_empty_set_when_the_source_finds_nobody() {
     let chain = FakeChain::default();
+    let owner = wallet(1);
 
-    let found = discover(&chain, store_a(), &epoch()).expect("a reachable source answers");
+    let found = discover(&chain, store_a(), root_1(), owner.puzzle_hash, &epoch())
+        .expect("a reachable source answers");
 
     assert!(found.is_empty());
     assert_eq!(found.rejected_candidates(), 0);
     assert_eq!(found.store_launcher_id(), store_a());
+    assert_eq!(found.root_hash(), root_1());
+    assert_eq!(found.owner_puzzle_hash(), owner.puzzle_hash);
 }
 
 #[test]
@@ -313,7 +371,7 @@ fn discover_errors_rather_than_reporting_an_empty_set_when_the_index_cannot_answ
         ..FakeChain::default()
     };
 
-    let error = discover(&chain, store_a(), &epoch())
+    let error = discover(&chain, store_a(), root_1(), wallet(1).puzzle_hash, &epoch())
         .expect_err("an unanswerable read is not an answer of 'nobody'");
 
     assert!(matches!(error, MirrorError::ChainUnavailable(_)));
@@ -331,14 +389,23 @@ fn discover_errors_rather_than_reporting_an_empty_set_when_the_index_cannot_answ
 fn discover_propagates_an_unreachable_read_even_when_another_candidate_would_have_answered() {
     let owner = wallet(1);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &owner, store_a(), "https://honest.example");
+    publish_mirror(
+        &mut chain,
+        &owner,
+        store_a(),
+        root_1(),
+        "https://honest.example",
+    );
 
     let stranger = wallet(2);
-    let (_spend, unreadable) = creating_spend(&stranger, &mirror_memos(store_a(), &["https://x"]));
-    chain.publish_without_creating_spend(unreadable, morph_store_launcher_id(store_a(), &epoch()));
+    let (_spend, unreadable) = creating_spend(
+        &stranger,
+        &mirror_memos(&stranger, store_a(), root_1(), &["https://x"]),
+    );
+    chain.publish_without_creating_spend(unreadable, hint_of(&owner, store_a(), root_1()));
     chain.spend_read_fails_for = Some(unreadable.parent_coin_info);
 
-    let error = discover(&chain, store_a(), &epoch())
+    let error = discover(&chain, store_a(), root_1(), owner.puzzle_hash, &epoch())
         .expect_err("a source that could not answer must not be reported as a partial answer");
 
     assert!(matches!(error, MirrorError::ChainUnavailable(_)));
@@ -348,14 +415,21 @@ fn discover_propagates_an_unreachable_read_even_when_another_candidate_would_hav
 fn discover_drops_a_candidate_with_no_creating_spend_and_keeps_the_honest_one() {
     let owner = wallet(1);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &owner, store_a(), "https://honest.example");
+    publish_mirror(
+        &mut chain,
+        &owner,
+        store_a(),
+        root_1(),
+        "https://honest.example",
+    );
 
     // Anyone can hint a coin to anyone's namespace value for the price of a dust coin. One such coin
     // must not be able to suppress every honest mirror, so this is dropped rather than fatal.
     let noise = Coin::new(Bytes32::new([0x77; 32]), mirror_coin_puzzle_hash(), 1);
-    chain.publish_without_creating_spend(noise, morph_store_launcher_id(store_a(), &epoch()));
+    chain.publish_without_creating_spend(noise, hint_of(&owner, store_a(), root_1()));
 
-    let found = discover(&chain, store_a(), &epoch()).expect("the source answered");
+    let found = discover(&chain, store_a(), root_1(), owner.puzzle_hash, &epoch())
+        .expect("the source answered");
 
     assert_eq!(found.claims().len(), 1);
     assert_eq!(found.rejected_candidates(), 1);
@@ -373,23 +447,201 @@ fn discover_rejects_a_coin_hinted_here_that_actually_advertises_another_store() 
     let stranger = wallet(3);
     let mut chain = FakeChain::default();
 
-    let (spend, coin) = creating_spend(&stranger, &mirror_memos(store_b(), &["https://elsewhere"]));
-    chain.publish(spend, coin, morph_store_launcher_id(store_a(), &epoch()));
+    let (spend, coin) = creating_spend(
+        &stranger,
+        &mirror_memos(&stranger, store_b(), root_1(), &["https://elsewhere"]),
+    );
+    chain.publish(spend, coin, hint_of(&stranger, store_a(), root_1()));
 
-    let found = discover(&chain, store_a(), &epoch()).expect("the source answered");
+    let found = discover(&chain, store_a(), root_1(), stranger.puzzle_hash, &epoch())
+        .expect("the source answered");
 
     assert!(found.is_empty());
     assert_eq!(found.rejected_candidates(), 1);
+}
+
+/// **The attack this release exists to stop**: a hostile peer offers a real, fully-collateralised
+/// mirror coin that bonds something else, and claims it bonds the store and root you asked for.
+///
+/// The coin is honest in every respect a check could be lazy about — genuine $DIG, genuine
+/// collateral, genuine owner, genuine epoch, and its creator deliberately hinted it into the bucket
+/// the victim's query reads, which anyone may do for the price of the coin they were minting anyway.
+/// The single thing wrong with it is that it declares **root 2** while sitting where root 1 is
+/// looked for.
+///
+/// If that were accepted, one stake would back unlimited claims: a peer could bond one cheap root
+/// once and answer for every root of every store. That is not a lookup nuisance — the point of a
+/// per-root coin is that a publisher's money buys a mirror of the root they paid for.
+///
+/// The honest coin beside it is what makes the test discriminating. An implementation that rejected
+/// everything, or one whose bucket was simply empty, passes the first assertion and fails the
+/// second, so only the pair pins the rule.
+#[test]
+fn discover_rejects_a_real_mirror_coin_that_bonds_a_different_root() {
+    let peer = wallet(3);
+    let mut chain = FakeChain::default();
+
+    // Hostile: declares root 2, hinted into root 1's bucket.
+    //
+    // The two amounts differ so these are genuinely two coins. The fixture derives its parent from
+    // owner + asset + amount, so building both at the same amount yields ONE coin id and the second
+    // publish overwrites the first's creating spend — leaving a fixture in which the hostile coin
+    // does not exist at all and the rejection below is a coincidence.
+    let (hostile_spend, hostile) = creating_spend_of_amount(
+        &peer,
+        &declared_memos(
+            hint_of(&peer, store_a(), root_1()),
+            store_a(),
+            root_2(),
+            &epoch(),
+            &["https://stale.example"],
+        ),
+        COLLATERAL,
+    );
+    chain.publish(hostile_spend, hostile, hint_of(&peer, store_a(), root_1()));
+
+    // Honest: declares root 2 and is hinted where root 2 is looked for.
+    let (honest_spend, honest) = creating_spend_of_amount(
+        &peer,
+        &mirror_memos(&peer, store_a(), root_2(), &["https://fresh.example"]),
+        COLLATERAL / 2,
+    );
+    chain.publish(honest_spend, honest, hint_of(&peer, store_a(), root_2()));
+
+    assert_ne!(
+        hostile.coin_id(),
+        honest.coin_id(),
+        "the fixture must really hold two different coins"
+    );
+
+    let asked_for_root_1 = discover(&chain, store_a(), root_1(), peer.puzzle_hash, &epoch())
+        .expect("the source answered");
+
+    assert!(
+        asked_for_root_1.is_empty(),
+        "collateral staked on another root must not answer for this one"
+    );
+    assert_eq!(asked_for_root_1.rejected_candidates(), 1);
+
+    let asked_for_root_2 = discover(&chain, store_a(), root_2(), peer.puzzle_hash, &epoch())
+        .expect("the source answered");
+
+    assert_eq!(
+        asked_for_root_2.claims().len(),
+        1,
+        "the honest bond for root 2 must still be found, or the rejection above proves nothing"
+    );
+    assert_eq!(asked_for_root_2.claims()[0].coin(), honest);
+    assert_eq!(asked_for_root_2.claims()[0].root_hash(), root_2());
+}
+
+/// The mirror image of the test above: a coin that DECLARES the tuple asked about but was published
+/// under a different hint answers for nothing.
+///
+/// This is what makes the recompute in `advertises` load-bearing rather than decorative. The
+/// declaration check alone accepts this coin, because its declaration is exactly right; only
+/// recomputing the hint from the declared terms and the coin's own lineage-proof owner reveals that
+/// the coin is not where that advertisement lives.
+#[test]
+fn discover_rejects_a_coin_that_declares_this_advertisement_but_is_hinted_elsewhere() {
+    let peer = wallet(3);
+    let mut chain = FakeChain::default();
+
+    let (spend, coin) = creating_spend(
+        &peer,
+        &declared_memos(
+            hint_of(&peer, store_a(), root_2()),
+            store_a(),
+            root_1(),
+            &epoch(),
+            &["https://squatting.example"],
+        ),
+    );
+    // Placed in the bucket the victim's query reads, so the query really does examine it.
+    chain.publish(spend, coin, hint_of(&peer, store_a(), root_1()));
+
+    let found = discover(&chain, store_a(), root_1(), peer.puzzle_hash, &epoch())
+        .expect("the source answered");
+
+    assert!(
+        found.is_empty(),
+        "a coin whose declaration and hint disagree bonds nothing"
+    );
+    assert_eq!(found.rejected_candidates(), 1);
+}
+
+/// The owner axis, from both sides: a coin is found for the owner who really controls it and not for
+/// anyone else, even though the caller supplies the owner as a plain argument.
+///
+/// The owner in the hint comes from the caller, but the owner in the check comes from the coin's
+/// **lineage proof**. If `advertises` recomputed with the caller's value instead, a caller could name
+/// any owner and have a stranger's coin answer for them — which is the shape of every "prove this
+/// peer is bonded" surface built on top of this crate.
+#[test]
+fn a_bond_answers_for_its_real_owner_and_not_for_a_named_stranger() {
+    let peer = wallet(3);
+    let stranger = wallet(4);
+    let mut chain = FakeChain::default();
+
+    // The coin is the peer's, but it was hinted into the bucket a query naming the STRANGER reads.
+    let (spend, coin) = creating_spend(
+        &peer,
+        &declared_memos(
+            hint_of(&stranger, store_a(), root_1()),
+            store_a(),
+            root_1(),
+            &epoch(),
+            &["https://peer.example"],
+        ),
+    );
+    chain.publish(spend, coin, hint_of(&stranger, store_a(), root_1()));
+
+    let as_stranger = discover(&chain, store_a(), root_1(), stranger.puzzle_hash, &epoch())
+        .expect("the source answered");
+
+    assert!(
+        as_stranger.is_empty(),
+        "naming an owner must not make somebody else's coin answer for them"
+    );
+    assert_eq!(as_stranger.rejected_candidates(), 1);
+
+    // The control: the peer's own honest bond is found when the peer is named.
+    let mut honest_chain = FakeChain::default();
+    publish_mirror(
+        &mut honest_chain,
+        &peer,
+        store_a(),
+        root_1(),
+        "https://peer.example",
+    );
+    let as_peer = discover(
+        &honest_chain,
+        store_a(),
+        root_1(),
+        peer.puzzle_hash,
+        &epoch(),
+    )
+    .expect("the source answered");
+
+    assert_eq!(as_peer.claims().len(), 1);
+    assert_eq!(as_peer.claims()[0].owner_puzzle_hash(), peer.puzzle_hash);
 }
 
 #[test]
 fn discover_ignores_a_mirror_published_for_a_different_epoch() {
     let owner = wallet(1);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &owner, store_a(), "https://honest.example");
+    publish_mirror(
+        &mut chain,
+        &owner,
+        store_a(),
+        root_1(),
+        "https://honest.example",
+    );
 
     let other_epoch = BigInt::from(43);
-    let found = discover(&chain, store_a(), &other_epoch).expect("the source answered");
+    let found = discover(&chain, store_a(), root_1(), owner.puzzle_hash, &other_epoch)
+        .expect("the source answered");
 
     assert!(found.is_empty());
 }
@@ -403,8 +655,20 @@ fn list_returns_only_the_coins_the_caller_controls() {
     let mine = wallet(1);
     let theirs = wallet(2);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
-    publish_mirror(&mut chain, &theirs, store_a(), "https://theirs.example");
+    publish_mirror(
+        &mut chain,
+        &mine,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
+    publish_mirror(
+        &mut chain,
+        &theirs,
+        store_a(),
+        root_1(),
+        "https://theirs.example",
+    );
 
     let owned = list(&chain, mine.puzzle_hash).expect("the source answered");
 
@@ -419,7 +683,13 @@ fn list_reports_no_coins_for_an_owner_who_has_locked_nothing() {
     let mine = wallet(1);
     let theirs = wallet(2);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &theirs, store_a(), "https://theirs.example");
+    publish_mirror(
+        &mut chain,
+        &theirs,
+        store_a(),
+        root_1(),
+        "https://theirs.example",
+    );
 
     let owned = list(&chain, mine.puzzle_hash).expect("the source answered");
 
@@ -438,14 +708,20 @@ fn list_reports_no_coins_for_an_owner_who_has_locked_nothing() {
 fn list_discloses_a_candidate_it_could_not_authenticate_rather_than_dropping_or_denying() {
     let mine = wallet(1);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+    publish_mirror(
+        &mut chain,
+        &mine,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
 
     let orphan = Coin::new(
         Bytes32::new([0x55; 32]),
         mirror_coin_puzzle_hash(),
         COLLATERAL,
     );
-    chain.publish_without_creating_spend(orphan, morph_store_launcher_id(store_a(), &epoch()));
+    chain.publish_without_creating_spend(orphan, hint_of(&mine, store_a(), root_1()));
 
     let inventory = list(&chain, mine.puzzle_hash)
         .expect("one unresolvable candidate must not deny the whole inventory");
@@ -476,7 +752,7 @@ fn an_undecodable_candidate_is_disclosed_as_undecodable_not_as_unauthenticated()
     publish_undecodable_coin(&mut chain, &mine);
 
     let orphan = Coin::new(Bytes32::new([0x55; 32]), mirror_coin_puzzle_hash(), 7);
-    chain.publish_without_creating_spend(orphan, morph_store_launcher_id(store_a(), &epoch()));
+    chain.publish_without_creating_spend(orphan, hint_of(&mine, store_a(), root_1()));
 
     let inventory = list(&chain, mine.puzzle_hash).expect("the source answered");
     let orphan_reason = inventory
@@ -502,8 +778,20 @@ fn an_inventory_that_resolved_every_candidate_reports_itself_complete() {
     let mine = wallet(1);
     let theirs = wallet(2);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
-    publish_mirror(&mut chain, &theirs, store_a(), "https://theirs.example");
+    publish_mirror(
+        &mut chain,
+        &mine,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
+    publish_mirror(
+        &mut chain,
+        &theirs,
+        store_a(),
+        root_1(),
+        "https://theirs.example",
+    );
 
     let inventory = list(&chain, mine.puzzle_hash).expect("the source answered");
 
@@ -523,10 +811,19 @@ fn list_propagates_an_unreachable_source_rather_than_recording_it_as_a_skip() {
     let mine = wallet(1);
     let stranger = wallet(2);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+    publish_mirror(
+        &mut chain,
+        &mine,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
 
-    let (_spend, unreadable) = creating_spend(&stranger, &mirror_memos(store_a(), &["https://x"]));
-    chain.publish_without_creating_spend(unreadable, morph_store_launcher_id(store_a(), &epoch()));
+    let (_spend, unreadable) = creating_spend(
+        &stranger,
+        &mirror_memos(&stranger, store_a(), root_1(), &["https://x"]),
+    );
+    chain.publish_without_creating_spend(unreadable, hint_of(&mine, store_a(), root_1()));
     chain.spend_read_fails_for = Some(unreadable.parent_coin_info);
 
     let error = list(&chain, mine.puzzle_hash)
@@ -550,7 +847,13 @@ fn a_strangers_undecodable_coin_does_not_deny_an_owner_their_inventory() {
     let mine = wallet(1);
     let stranger = wallet(9);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+    publish_mirror(
+        &mut chain,
+        &mine,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
     publish_undecodable_coin(&mut chain, &stranger);
 
     let inventory = list(&chain, mine.puzzle_hash)
@@ -576,7 +879,13 @@ fn a_strangers_undecodable_coin_cannot_jam_the_completeness_signal() {
     let mine = wallet(1);
     let stranger = wallet(9);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+    publish_mirror(
+        &mut chain,
+        &mine,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
     let junk = publish_undecodable_coin(&mut chain, &stranger);
 
     let inventory = list(&chain, mine.puzzle_hash).expect("the source answered");
@@ -603,7 +912,13 @@ fn a_strangers_undecodable_coin_cannot_jam_the_completeness_signal() {
 fn the_owners_own_undecodable_coin_is_still_disclosed_to_them() {
     let mine = wallet(1);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &mine, store_a(), "https://mine.example");
+    publish_mirror(
+        &mut chain,
+        &mine,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
     let mine_but_unreadable = publish_undecodable_coin(&mut chain, &mine);
 
     let inventory = list(&chain, mine.puzzle_hash).expect("the source answered");
@@ -639,15 +954,25 @@ fn both_mirror_coins_created_by_one_parent_spend_are_found() {
     let smaller = 500_000u64;
     let (spend, coins) = creating_spend_of_children(&mine, DIG_ASSET_ID, larger + smaller, |ctx| {
         let first = ctx
-            .alloc(&mirror_memos(store_a(), &["https://first.example"]))
+            .alloc(&mirror_memos(
+                &mine,
+                store_a(),
+                root_1(),
+                &["https://first.example"],
+            ))
             .unwrap();
         let second = ctx
-            .alloc(&mirror_memos(store_a(), &["https://second.example"]))
+            .alloc(&mirror_memos(
+                &mine,
+                store_a(),
+                root_1(),
+                &["https://second.example"],
+            ))
             .unwrap();
         vec![(larger, Memos::Some(first)), (smaller, Memos::Some(second))]
     });
 
-    let hint = morph_store_launcher_id(store_a(), &epoch());
+    let hint = hint_of(&mine, store_a(), root_1());
     chain.publish(spend.clone(), coins[0], hint);
     chain.publish(spend, coins[1], hint);
 
@@ -665,7 +990,8 @@ fn both_mirror_coins_created_by_one_parent_spend_are_found() {
         "a second mirror coin from one parent spend must not vanish from its owner's inventory"
     );
 
-    let found = discover(&chain, store_a(), &epoch()).expect("the source answered");
+    let found = discover(&chain, store_a(), root_1(), mine.puzzle_hash, &epoch())
+        .expect("the source answered");
     assert_eq!(found.claims().len(), 2);
     assert_eq!(found.rejected_candidates(), 0);
 }
@@ -679,7 +1005,9 @@ fn both_mirror_coins_created_by_one_parent_spend_are_found() {
 fn the_candidate_bound_stops_a_scan_only_once_it_is_exceeded() {
     let mine = wallet(1);
 
-    let at_limit = list(&flooded_chain(MAX_CANDIDATES), mine.puzzle_hash)
+    let flood_hint = hint_of(&mine, store_a(), root_1());
+
+    let at_limit = list(&flooded_chain(MAX_CANDIDATES, flood_hint), mine.puzzle_hash)
         .expect("a flood must not deny the query");
     assert!(
         !at_limit.is_truncated(),
@@ -687,8 +1015,11 @@ fn the_candidate_bound_stops_a_scan_only_once_it_is_exceeded() {
     );
     assert_eq!(at_limit.skipped().len(), MAX_CANDIDATES);
 
-    let over_limit = list(&flooded_chain(MAX_CANDIDATES + 1), mine.puzzle_hash)
-        .expect("a flood must not deny the query");
+    let over_limit = list(
+        &flooded_chain(MAX_CANDIDATES + 1, flood_hint),
+        mine.puzzle_hash,
+    )
+    .expect("a flood must not deny the query");
     assert!(
         over_limit.is_truncated(),
         "one candidate past the limit must stop the scan and be disclosed"
@@ -701,21 +1032,37 @@ fn the_candidate_bound_stops_a_scan_only_once_it_is_exceeded() {
 }
 
 /// `discover` walks a list anyone may add to, so it carries the same bound — and, being the verb
-/// whose empty answer is read as *nobody mirrors this*, it MUST disclose when that answer is partial.
+/// whose empty answer is read as *this peer is not bonded*, it MUST disclose when that answer is
+/// partial.
 #[test]
 fn a_flood_bounds_discovery_and_is_disclosed_rather_than_answered_as_nobody() {
-    let over_limit = discover(&flooded_chain(MAX_CANDIDATES + 1), store_a(), &epoch())
-        .expect("a flood must not deny the query");
+    let peer = wallet(1);
+    let flood_hint = hint_of(&peer, store_a(), root_1());
+
+    let over_limit = discover(
+        &flooded_chain(MAX_CANDIDATES + 1, flood_hint),
+        store_a(),
+        root_1(),
+        peer.puzzle_hash,
+        &epoch(),
+    )
+    .expect("a flood must not deny the query");
 
     assert!(over_limit.is_empty());
     assert!(
         over_limit.is_truncated(),
-        "an empty claim set from a truncated scan must not be readable as 'nobody mirrors this'"
+        "an empty claim set from a truncated scan must not be readable as 'this peer is not bonded'"
     );
     assert_eq!(over_limit.rejected_candidates(), MAX_CANDIDATES);
 
-    let at_limit = discover(&flooded_chain(MAX_CANDIDATES), store_a(), &epoch())
-        .expect("a flood must not deny the query");
+    let at_limit = discover(
+        &flooded_chain(MAX_CANDIDATES, flood_hint),
+        store_a(),
+        root_1(),
+        peer.puzzle_hash,
+        &epoch(),
+    )
+    .expect("a flood must not deny the query");
     assert!(!at_limit.is_truncated());
 }
 
@@ -726,14 +1073,19 @@ fn a_collateral_coin_advertising_no_urls_is_not_a_mirror_coin() {
     let mine = wallet(1);
     let mut chain = FakeChain::default();
 
-    let bare = vec![Bytes::new(
-        morph_store_launcher_id(store_a(), &epoch()).to_vec(),
-    )];
+    let bare = declared_memos(
+        hint_of(&mine, store_a(), root_1()),
+        store_a(),
+        root_1(),
+        &epoch(),
+        &[],
+    );
     let (spend, coin) = creating_spend(&mine, &bare);
-    chain.publish(spend, coin, morph_store_launcher_id(store_a(), &epoch()));
+    chain.publish(spend, coin, hint_of(&mine, store_a(), root_1()));
 
     let owned = list(&chain, mine.puzzle_hash).expect("the source answered");
-    let found = discover(&chain, store_a(), &epoch()).expect("the source answered");
+    let found = discover(&chain, store_a(), root_1(), mine.puzzle_hash, &epoch())
+        .expect("the source answered");
 
     assert!(owned.coins().is_empty());
     assert!(found.is_empty());
@@ -748,7 +1100,13 @@ fn reclaim_is_refused_for_a_wallet_that_does_not_control_the_coin() {
     let owner = wallet(1);
     let attacker = wallet(2);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
+    publish_mirror(
+        &mut chain,
+        &owner,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
 
     let mirror = list(&chain, owner.puzzle_hash)
         .expect("the source answered")
@@ -771,7 +1129,13 @@ fn reclaim_is_refused_for_a_wallet_that_does_not_control_the_coin() {
 fn reclaim_recreates_the_entire_collateral_as_dig_at_the_owners_address() {
     let owner = wallet(1);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
+    publish_mirror(
+        &mut chain,
+        &owner,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
 
     let mirror = list(&chain, owner.puzzle_hash)
         .expect("the source answered")
@@ -804,7 +1168,13 @@ fn reclaim_recreates_the_entire_collateral_as_dig_at_the_owners_address() {
 fn reclaimed_collateral_is_hinted_to_the_owner_so_a_wallet_can_find_it() {
     let owner = wallet(1);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
+    publish_mirror(
+        &mut chain,
+        &owner,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
 
     let inventory = list(&chain, owner.puzzle_hash).expect("the source answered");
     let spends =
@@ -863,20 +1233,87 @@ fn create_coins(spend: &CoinSpend) -> Vec<(Bytes32, u64)> {
         .collect()
 }
 
-/// A parsed mirror coin knows which store it advertises only by recomputing the morph, so the check
-/// answers truthfully for the store it was published for and falsely for any other.
+/// `advertises` answers truthfully for the advertisement the coin was published for and falsely for
+/// any other — each of the three terms varied ALONE, so a check that dropped any one of them is
+/// caught by the axis it dropped rather than hidden by the other two.
 #[test]
-fn advertises_answers_only_for_the_store_the_coin_was_published_for() {
+fn advertises_answers_only_for_the_advertisement_the_coin_was_published_for() {
     let owner = wallet(1);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
+    publish_mirror(
+        &mut chain,
+        &owner,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
 
     let inventory = list(&chain, owner.puzzle_hash).expect("the source answered");
     let mirror = &inventory.coins()[0];
 
-    assert!(mirror.advertises(store_a(), &epoch()));
-    assert!(!mirror.advertises(store_b(), &epoch()));
-    assert!(!mirror.advertises(store_a(), &BigInt::from(43)));
+    assert!(mirror.advertises(store_a(), root_1(), &epoch()));
+    assert!(!mirror.advertises(store_b(), root_1(), &epoch()));
+    assert!(!mirror.advertises(store_a(), root_2(), &epoch()));
+    assert!(!mirror.advertises(store_a(), root_1(), &BigInt::from(43)));
+
+    // The coin also says what it bonds without being asked, which is what lets an owner match its
+    // own coins against the `.dig` files on its disk instead of guessing candidates.
+    assert_eq!(mirror.store_launcher_id(), store_a());
+    assert_eq!(mirror.root_hash(), root_1());
+    assert_eq!(mirror.epoch(), &epoch());
+}
+
+/// **The collision case.** The morph is a sum, so a deliberately constructed second tuple lands on
+/// the identical hint — and `advertises` must still refuse it.
+///
+/// This is the test that makes the *declared tuple* comparison load-bearing. The recompute cannot
+/// reject this coin: recomputing from the colliding tuple produces exactly the hint the coin
+/// carries, because that is what a collision is. Only comparing what the coin SAYS it bonds against
+/// what was asked separates the two.
+///
+/// The first assertion is the control. Without it, a broken `advertises` that answered `false` to
+/// everything would pass the second and prove nothing.
+#[test]
+fn a_colliding_tuple_is_refused_even_though_it_recomputes_to_the_same_hint() {
+    let owner = wallet(1);
+
+    // store + 1 and root - 1: a different advertisement, an identical sum, an identical hint.
+    let mut store = [0u8; 32];
+    store[31] = 5;
+    let mut root = [0u8; 32];
+    root[31] = 4;
+    let (store, root) = (Bytes32::new(store), Bytes32::new(root));
+    let colliding_store = Bytes32::new({
+        let mut bytes = [0u8; 32];
+        bytes[31] = 4;
+        bytes
+    });
+    let colliding_root = Bytes32::new({
+        let mut bytes = [0u8; 32];
+        bytes[31] = 5;
+        bytes
+    });
+
+    assert_eq!(
+        mirror_hint(store, root, owner.puzzle_hash, &epoch()),
+        mirror_hint(colliding_store, colliding_root, owner.puzzle_hash, &epoch()),
+        "the fixture is only meaningful if the two tuples really do collide"
+    );
+
+    let mut chain = FakeChain::default();
+    publish_mirror(&mut chain, &owner, store, root, "https://mine.example");
+    let inventory = list(&chain, owner.puzzle_hash).expect("the source answered");
+    let mirror = &inventory.coins()[0];
+
+    assert!(
+        mirror.advertises(store, root, &epoch()),
+        "the coin answers for the advertisement it really bonds"
+    );
+    assert!(
+        !mirror.advertises(colliding_store, colliding_root, &epoch()),
+        "a tuple that merely hashes to the same hint is a different advertisement, and the \
+         collateral is not staked on it"
+    );
 }
 
 /// Guards against an unused-import drift in the fixture: `Puzzle` is what the crate uses to parse a
@@ -884,8 +1321,10 @@ fn advertises_answers_only_for_the_store_the_coin_was_published_for() {
 #[test]
 fn fixture_spends_are_parseable_puzzles() {
     let owner = wallet(1);
-    let (spend, _coin) =
-        creating_spend(&owner, &mirror_memos(store_a(), &["https://mine.example"]));
+    let (spend, _coin) = creating_spend(
+        &owner,
+        &mirror_memos(&owner, store_a(), root_1(), &["https://mine.example"]),
+    );
 
     let mut allocator = Allocator::new();
     let ptr = spend.puzzle_reveal.to_clvm(&mut allocator).unwrap();
@@ -926,6 +1365,7 @@ fn a_mirror_this_crate_creates_is_a_mirror_this_crate_discovers() {
     let spends = create(
         MirrorAdvertisement {
             store_launcher_id: store_a(),
+            root_hash: root_1(),
             epoch: epoch(),
             urls: vec!["https://published.example".to_string()],
             collateral: COLLATERAL,
@@ -951,10 +1391,11 @@ fn a_mirror_this_crate_creates_is_a_mirror_this_crate_discovers() {
     chain.publish(
         creating.clone(),
         published,
-        morph_store_launcher_id(store_a(), &epoch()),
+        hint_of(&owner, store_a(), root_1()),
     );
 
-    let found = discover(&chain, store_a(), &epoch()).expect("the source answered");
+    let found = discover(&chain, store_a(), root_1(), owner.puzzle_hash, &epoch())
+        .expect("the source answered");
 
     assert_eq!(
         found.claims().len(),
@@ -964,6 +1405,18 @@ fn a_mirror_this_crate_creates_is_a_mirror_this_crate_discovers() {
     assert_eq!(found.claims()[0].urls(), ["https://published.example"]);
     assert_eq!(found.claims()[0].collateral(), COLLATERAL);
     assert_eq!(found.claims()[0].owner_puzzle_hash(), owner.puzzle_hash);
+
+    // The writer's declaration survives the round trip, so the memo layout `create` emits and the
+    // one `parse_memos` reads are the same layout — a disagreement there would be invisible in every
+    // fixture that builds its own memos.
+    assert_eq!(found.claims()[0].store_launcher_id(), store_a());
+    assert_eq!(found.claims()[0].root_hash(), root_1());
+    assert_eq!(found.claims()[0].epoch(), &epoch());
+
+    // And it is NOT discoverable for the other root, which is what the publisher is paying for.
+    let other_root = discover(&chain, store_a(), root_2(), owner.puzzle_hash, &epoch())
+        .expect("the source answered");
+    assert!(other_root.is_empty());
 }
 
 /// Collateral in some other CAT is not collateral.
@@ -979,12 +1432,13 @@ fn a_mirror_collateralised_in_another_cat_is_refused() {
 
     let (spend, coin) = creating_spend_of_asset(
         &attacker,
-        &mirror_memos(store_a(), &["https://free.example"]),
+        &mirror_memos(&attacker, store_a(), root_1(), &["https://free.example"]),
         worthless,
     );
-    chain.publish(spend, coin, morph_store_launcher_id(store_a(), &epoch()));
+    chain.publish(spend, coin, hint_of(&attacker, store_a(), root_1()));
 
-    let found = discover(&chain, store_a(), &epoch()).expect("the source answered");
+    let found = discover(&chain, store_a(), root_1(), attacker.puzzle_hash, &epoch())
+        .expect("the source answered");
 
     assert!(found.is_empty(), "a non-$DIG mirror must not be a claim");
     assert_eq!(found.rejected_candidates(), 1);
@@ -999,7 +1453,13 @@ fn a_mirror_collateralised_in_another_cat_is_refused() {
 fn reclaim_with_a_fee_still_returns_the_whole_collateral() {
     let owner = wallet(1);
     let mut chain = FakeChain::default();
-    publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
+    publish_mirror(
+        &mut chain,
+        &owner,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
 
     let mirror = list(&chain, owner.puzzle_hash)
         .expect("the source answered")
@@ -1032,7 +1492,13 @@ fn reclaim_with_a_fee_still_returns_the_whole_collateral() {
 fn a_parsed_mirror_reports_its_own_coin_and_lineage() {
     let owner = wallet(1);
     let mut chain = FakeChain::default();
-    let published = publish_mirror(&mut chain, &owner, store_a(), "https://mine.example");
+    let published = publish_mirror(
+        &mut chain,
+        &owner,
+        store_a(),
+        root_1(),
+        "https://mine.example",
+    );
 
     let mirror = list(&chain, owner.puzzle_hash)
         .expect("the source answered")
@@ -1044,6 +1510,6 @@ fn a_parsed_mirror_reports_its_own_coin_and_lineage() {
     assert_eq!(mirror.proof().parent_inner_puzzle_hash, owner.puzzle_hash);
     assert_eq!(
         mirror.namespace_hint(),
-        morph_store_launcher_id(store_a(), &epoch())
+        hint_of(&owner, store_a(), root_1())
     );
 }

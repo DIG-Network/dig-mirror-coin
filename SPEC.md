@@ -49,21 +49,57 @@ The operation that returns locked collateral to its owner is named **reclaim**. 
 
 ## 4. The namespace
 
-A store launcher id MUST be morphed into the mirror namespace before use as a hint:
+A mirror advertisement is the tuple `(store_launcher_id, root_hash, owner_puzzle_hash, epoch)`. It
+MUST be morphed into the mirror namespace before use as a hint:
 
 ```
-morph(store_launcher_id, epoch) = tree_hash( (int(store_launcher_id) + epoch, "DIG_STORE_MIRROR_COLLATERAL") )
+morph(store, root, owner, epoch) =
+    tree_hash( (int(store) + int(root) + int(owner) + epoch, "DIG_STORE_MIRROR_COLLATERAL") )
 ```
 
-where `int(...)` reads the launcher id as a big-endian signed integer. `DIG_STORE_MIRROR_COLLATERAL`
+where `int(...)` reads a 32-byte value as a big-endian signed integer. `DIG_STORE_MIRROR_COLLATERAL`
 is a wire constant.
 
-The morph is one-way and MUST NOT be inverted. A consumer that needs to know which store a coin
-advertises MUST recompute the morph from a candidate store id and compare.
+A mirror coin bonds **one root of one store**, not a store as a whole. A publisher MUST be able to
+fund the current root and decline earlier ones, and a node's mirror coin for a store and root SHOULD
+exist exactly while the `.dig` file for that store at that root is held.
 
-The offset is arithmetic, so a store one unit ahead at epoch *n* and a store one unit behind at
-epoch *n+1* produce the SAME namespace value. A namespace value therefore identifies no store on its
-own, which is a further reason §3.2 binds.
+The morph is one-way and MUST NOT be inverted. A consumer that needs to know what a coin advertises
+MUST bring candidate terms and compare, per §4.1.
+
+### 4.1 The namespace value is an index and MUST NOT be treated as a binding
+
+The morph is a sum, so distinct tuples produce an identical value: `(store, root, owner, epoch)` and
+`(store + 1, root - 1, owner, epoch)` collide by construction. A namespace value therefore identifies
+no advertisement on its own, which is a further reason §3.2 binds.
+
+For the three 32-byte terms the collision is unreachable in practice — a launcher id, a merkle root
+and a puzzle hash are each the output of a hash, so steering their sum onto a chosen target is a
+2^256 search. **The epoch is not.** It is an unbounded integer chosen freely by whoever builds the
+coin, so its author can solve for a value that places a coin bonding their own store and root exactly
+on another advertisement's hint:
+
+```
+e' = store + root + owner + epoch - store' - root' - owner'
+```
+
+Accepting a coin on a recomputed hint alone would therefore let **one stake back unlimited claims**.
+
+An implementation MUST NOT decide what a coin advertises from the namespace value alone. A mirror
+coin MUST declare its own `(store, root, epoch)` in its memos (§5), and a consumer checking a coin
+against an advertisement MUST perform BOTH of:
+
+1. compare the coin's **declared** tuple, term by term, against the tuple asked about; and
+2. recompute the namespace value from the tuple asked about and the owner taken from the coin's
+   **lineage proof**, and compare it against the coin's namespace value.
+
+Neither check substitutes for the other. Check 1 alone accepts a coin that declares one advertisement
+and is indexed as another; check 2 alone accepts a coin bonding an entirely different store, by the
+epoch solution above.
+
+The owner MUST be taken from the lineage proof and MUST NOT be taken from a caller-supplied argument
+or a memo. It is the one term of the four recoverable from the coin itself, which is what lets a
+consumer holding only a coin close the loop without trusting whoever supplied it.
 
 ## 5. Authentication
 
@@ -74,8 +110,23 @@ MUST take:
 - the **asset id**, from the parent's curried CAT puzzle. It MUST equal the $DIG asset id.
 - the **amount**, from the matching `CREATE_COIN` condition.
 - the **owner**, from the lineage proof's parent inner puzzle hash.
-- the **namespace value and URLs**, from the `CREATE_COIN` memos: the first entry is a 32-byte
-  namespace value, the remaining entries are URLs.
+- the **namespace value, the declared advertisement, and the URLs**, from the `CREATE_COIN` memos,
+  in this layout:
+
+  ```
+  [ hint(32) , store(32) , root(32) , epoch(signed big-endian) , url , url , … ]
+  ```
+
+  The prefix has fixed arity. Entries 0, 1 and 2 MUST each be exactly 32 bytes; entry 3 is the epoch
+  as a minimal signed big-endian integer, where an empty atom denotes zero. Every remaining entry is
+  a URL. An implementation MUST reject as not-mirror-shaped any memo list shorter than five entries
+  or whose fixed-width entries are the wrong width — a heterogeneous prefix read positionally without
+  shape checks is how the ancestor layout `[hint, peerIp, publicSyntheticKey]` surfaced a public key
+  as a URL.
+
+  The declared advertisement is the ONE property taken from the memos, and §4.1 states why: whoever
+  locks the collateral chooses what to stake it on, so the declaration is theirs to make and a
+  consumer's obligation is to compare it against what it asked about rather than to assume it.
 
 A coin whose creating spend cannot be read MUST NOT be accepted.
 
@@ -104,7 +155,11 @@ and §6.2 requires that owner to remain available rather than be discarded with 
 
 ### 6.1 create
 
-Locks collateral and publishes a mirror. The advertisement MUST carry at least one URL, and the
+Locks collateral and publishes a mirror for one root of one store. The advertisement MUST name a
+store, a root and an epoch, and the coin it produces MUST both be hinted to their morph (§4) and
+declare them in its memos (§5) — a coin whose hint and declaration disagree bonds nothing (§4.1).
+
+The advertisement MUST carry at least one URL, and the
 collateral MUST be non-zero — a claim staked on nothing is free, and §3.3 makes the cost the entire
 point of the coin. An implementation MUST NOT impose a higher floor: how much collateral is *enough*
 is an economic question for the network, and a number fixed here would become a wire constant.
@@ -140,14 +195,23 @@ displaced one level up, and it MUST NOT be reintroduced there.
 The caller's OWN unreadable coin MUST still be reported. Only the wallet controlling a coin can have
 written its memos, so that gap is real, is theirs, and is what the signal exists to convey.
 
-### 6.3 discover — keyed by store
+### 6.3 discover — keyed by the whole advertisement
 
-Answers *who mirrors this store*. An implementation MUST look up the store's namespace value in a
-hint index, then re-derive each candidate per §5 and keep only those whose recomputed namespace value
-matches the store and epoch asked about.
+Answers *does this owner bond this store, at this root, for this epoch*. An implementation MUST look
+up the advertisement's namespace value in a hint index, then re-derive each candidate per §5 and keep
+only those that satisfy BOTH checks of §4.1.
 
-An empty result MUST mean the source was consulted and found nobody advertising that store, and MUST
-NOT be presented that way when the scan stopped early (§6.5).
+The owner is a required input. Because it is one of the four morphed terms there is no store-wide
+bucket to enumerate, so this verb checks a **named** peer's bond and MUST NOT be described as a
+census of a store's mirrors. Peer discovery is the DHT's job; what this verb establishes is that the
+collateral behind a named peer's claim is real and is staked on the root asked for.
+
+Naming an owner MUST NOT make another owner's coin answer. The owner used in check 2 of §4.1 comes
+from the coin's lineage proof, so a caller that names the wrong owner receives an empty result rather
+than somebody else's coin.
+
+An empty result MUST mean the source was consulted and found no such bond, and MUST NOT be presented
+that way when the scan stopped early (§6.5).
 
 A candidate that fails authentication MUST be dropped and counted, not fatal — the hint index is
 writable by anyone, and one dust coin MUST NOT be able to suppress every honest mirror. A source that
@@ -207,6 +271,12 @@ An implementation conforms when:
 1. its mirror coins are verifiably $DIG by the outer-hash test in §3.1;
 2. its `reclaim` spend returns the full collateral to the creator;
 3. its `discover` rejects a coin hinted under a store it does not advertise;
+3a. its `discover` rejects a real, fully-collateralised mirror coin that bonds a DIFFERENT root of the
+    same store, while still returning that coin for the root it does bond (§4.1 check 1);
+3b. its `discover` rejects a coin that declares the advertisement asked about but was published under
+    a different namespace value (§4.1 check 2);
+3c. a tuple that collides with the coin's own advertisement under the morph is refused (§4.1);
+3d. naming an owner does not make a coin controlled by anyone else answer for them (§6.3);
 4. its `discover` rejects collateral held in any CAT other than $DIG;
 5. its `list` returns the caller's coins, and reports the unresolved candidate, when one candidate
    among them cannot be authenticated — neither erroring nor omitting it in silence (§6.2);
