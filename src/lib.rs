@@ -8,10 +8,22 @@
 //!
 //! | verb | what it does |
 //! |---|---|
-//! | [`create`] | locks $DIG and publishes a mirror for a store |
+//! | [`create`] | locks $DIG and publishes a mirror for one root of a store |
 //! | [`list`] | answers *which mirror coins are mine* |
-//! | [`discover`] | answers *who mirrors this store* |
+//! | [`discover`] | answers *does this peer bond this store at this root* |
 //! | [`reclaim`] | releases the collateral back to its owner |
+//!
+//! ## A mirror bonds a ROOT, not a store
+//!
+//! A store changes, and a publisher funding mirrors must be able to pay for the current root and
+//! decline the ones before it. So a mirror coin is per `(store, root, owner, epoch)`: one coin per
+//! root a peer actually holds, and a node's coin exists exactly while the `.dig` for that store at
+//! that root is on its disk. Withdrawing a root is [`reclaim`] on its coin, and it takes the money
+//! back with it.
+//!
+//! Because the owner is one of the four terms, [`discover`] checks a **named** peer's bond rather
+//! than enumerating a store's mirrors. Peers come from the DHT; what this crate answers is whether
+//! the collateral behind a peer's claim is real and is staked on the root being asked for.
 //!
 //! [`list`] and [`discover`] are separate on purpose. They are keyed differently, trusted
 //! differently, and an empty answer means something different in each — see [`query`].

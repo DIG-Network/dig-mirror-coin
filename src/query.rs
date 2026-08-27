@@ -3,7 +3,19 @@
 //! | verb | question | keyed by | an empty answer means |
 //! |---|---|---|---|
 //! | [`list`] | which mirror coins are mine? | owner puzzle hash | you have locked no collateral |
-//! | [`discover`] | who mirrors this store? | store launcher id | nobody advertises it |
+//! | [`discover`] | does this peer bond this store at this root? | the full advertisement | they do not |
+//!
+//! ## `discover` is a check on a named peer, not a census of a store
+//!
+//! It used to be the latter, and since 0.5.0 it cannot be: the hint is morphed from the **owner**
+//! along with the store, root and epoch, so there is no bucket holding "everyone who mirrors this
+//! store" to enumerate. A caller must name whose bond it is asking about.
+//!
+//! That is the shape the network actually needs. Peers are found by the DHT, which is where peer
+//! discovery belongs; what a peer's claim needs is a way to check that the collateral behind it is
+//! real and is staked on the store **and root** being asked for. A hostile peer handing over a coin
+//! id that bonds something else is the case this verb exists to reject, and it can only reject it by
+//! being told what it should have bonded.
 //!
 //! They resist collapsing into one function because their **trust** differs, not just their key.
 //! `list` is about the caller's own money, so under-reporting it is a real harm and every candidate
@@ -28,7 +40,7 @@ use num_bigint::BigInt;
 use crate::asset::mirror_coin_puzzle_hash;
 use crate::coin::{Candidate, MirrorCoin};
 use crate::error::MirrorError;
-use crate::namespace::morph_store_launcher_id;
+use crate::namespace::mirror_hint;
 
 /// The one chain read mirror discovery needs that the canonical [`ChainSource`] does not expose.
 ///
@@ -47,9 +59,9 @@ pub trait MirrorChainSource: ChainSource {
     fn unspent_coins_by_hint(&self, hint: Bytes32) -> Result<Vec<CoinRecord>, Self::Error>;
 }
 
-/// Everyone who advertises a store for one epoch, as answered by one chain source.
+/// One owner's claims over one store at one root for one epoch, as answered by one chain source.
 ///
-/// Empty [`claims`](Self::claims) is a real answer: the source was consulted and found nobody. A
+/// Empty [`claims`](Self::claims) is a real answer: the source was consulted and found nothing. A
 /// caller that could not reach a source gets `Err` from [`discover`] instead and must not treat the
 /// two alike.
 ///
@@ -59,6 +71,8 @@ pub trait MirrorChainSource: ChainSource {
 #[derive(Debug, Clone)]
 pub struct MirrorSet {
     store_launcher_id: Bytes32,
+    root_hash: Bytes32,
+    owner_puzzle_hash: Bytes32,
     epoch: BigInt,
     namespace_hint: Bytes32,
     claims: Vec<MirrorCoin>,
@@ -72,12 +86,22 @@ impl MirrorSet {
         self.store_launcher_id
     }
 
+    /// The store root these claims were sought for.
+    pub fn root_hash(&self) -> Bytes32 {
+        self.root_hash
+    }
+
+    /// The owner whose bond was asked about.
+    pub fn owner_puzzle_hash(&self) -> Bytes32 {
+        self.owner_puzzle_hash
+    }
+
     /// The epoch these claims were sought for.
     pub fn epoch(&self) -> &BigInt {
         &self.epoch
     }
 
-    /// The namespace value the store and epoch morph to — the hint that was searched.
+    /// The namespace value the four advertised terms morph to — the hint that was searched.
     pub fn namespace_hint(&self) -> Bytes32 {
         self.namespace_hint
     }
@@ -89,10 +113,10 @@ impl MirrorSet {
         &self.claims
     }
 
-    /// Whether the source found nobody advertising this store for this epoch.
+    /// Whether the source found no such bond.
     ///
     /// A read that failed is an `Err` and never reaches this method. A read that stopped early does
-    /// reach it, so `is_empty()` means *nobody advertises this store* only when
+    /// reach it, so `is_empty()` means *this owner bonds nothing here* only when
     /// [`is_truncated`](Self::is_truncated) is `false`; otherwise it means *nobody in the part that
     /// was examined*.
     pub fn is_empty(&self) -> bool {
@@ -298,18 +322,26 @@ pub fn list<S: ChainSource>(
     })
 }
 
-/// Answers *who mirrors this store*, keyed by the store launcher id and epoch.
+/// Answers *does this owner bond this store, at this root, for this epoch*.
 ///
-/// Searches the hint index for the store's namespace value, then re-derives each candidate from its
-/// creating spend and keeps only those that genuinely advertise this store. Candidates that cannot
-/// be authenticated are counted in [`MirrorSet::rejected_candidates`] and dropped; a source that
-/// cannot answer produces `Err`.
+/// Searches the hint index for the advertisement's namespace value, then re-derives each candidate
+/// from its creating spend and keeps only those that genuinely advertise it — declared tuple and
+/// recomputed hint both, via [`MirrorCoin::advertises`]. Candidates that cannot be authenticated are
+/// counted in [`MirrorSet::rejected_candidates`] and dropped; a source that cannot answer produces
+/// `Err`.
+///
+/// The owner is a parameter because the hint is morphed from it, so there is no store-wide bucket to
+/// read without one — see the module docs. It is not a weakening: a coin's owner is re-derived from
+/// its lineage proof during authentication, so naming the wrong owner yields an empty answer rather
+/// than somebody else's coin.
 pub fn discover<S: MirrorChainSource>(
     source: &S,
     store_launcher_id: Bytes32,
+    root_hash: Bytes32,
+    owner_puzzle_hash: Bytes32,
     epoch: &BigInt,
 ) -> Result<MirrorSet, MirrorError> {
-    let namespace_hint = morph_store_launcher_id(store_launcher_id, epoch);
+    let namespace_hint = mirror_hint(store_launcher_id, root_hash, owner_puzzle_hash, epoch);
     let candidates = source
         .unspent_coins_by_hint(namespace_hint)
         .map_err(unavailable)?;
@@ -323,7 +355,9 @@ pub fn discover<S: MirrorChainSource>(
         // is writable by anyone for the price of a dust coin, so one bad entry must not be able to
         // suppress every honest mirror. A source that could not ANSWER is different, and propagates.
         match authenticate(source, &candidate) {
-            Ok(Candidate::Mirror(mirror)) if mirror.advertises(store_launcher_id, epoch) => {
+            Ok(Candidate::Mirror(mirror))
+                if mirror.advertises(store_launcher_id, root_hash, epoch) =>
+            {
                 claims.push(mirror)
             }
             Ok(_) => rejected += 1,
@@ -336,6 +370,8 @@ pub fn discover<S: MirrorChainSource>(
 
     Ok(MirrorSet {
         store_launcher_id,
+        root_hash,
+        owner_puzzle_hash,
         epoch: epoch.clone(),
         namespace_hint,
         claims,
