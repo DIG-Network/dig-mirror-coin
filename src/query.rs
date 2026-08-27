@@ -196,6 +196,17 @@ impl MirrorInventory {
     /// `false` does NOT mean a coin is missing — it means one might be. A caller that would rather
     /// refuse than under-report its own money checks this and fails closed; that decision belongs to
     /// the caller, because only the caller knows what it is about to do with the answer.
+    ///
+    /// **And `true` does not mean nothing is missing.** This answers only for coins hinted under the
+    /// CURRENT scheme. A coin created by an earlier version sits under a different hint, so it is
+    /// never a candidate at all — not skipped, not truncated, simply invisible. `skipped` records
+    /// candidates that could not be resolved; it cannot record ones that were never looked at.
+    ///
+    /// Concretely: 0.4.0 hinted `morph(store + epoch)`, 0.5.0 hints
+    /// `morph(store + root + owner + epoch)`. **A 0.4.0-created coin is invisible to a 0.5.0 `list`,
+    /// which will nonetheless report itself complete.** Those coins are not lost — pin 0.4.0 to reach
+    /// them — but nothing in this type will tell you they exist. Stated because a completeness flag
+    /// that quietly excludes a whole hint scheme is the kind of thing a caller reasonably trusts.
     pub fn is_complete(&self) -> bool {
         self.skipped.is_empty() && !self.truncated
     }
