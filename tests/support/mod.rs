@@ -45,6 +45,19 @@ pub fn hint_of(owner: &Wallet, store: Bytes32, root: Bytes32) -> Bytes32 {
     mirror_hint(store, root, owner.puzzle_hash, &epoch())
 }
 
+/// The hint `owner`'s advertisement of `store` at `root` lands on in an ARBITRARY epoch.
+///
+/// Separate from [`hint_of`] so a test can build a coin that is honestly published for an epoch
+/// other than the current one — which is a different fixture from a coin that lies about its epoch.
+pub fn mirror_hint_for(
+    owner: &Wallet,
+    store: Bytes32,
+    root: Bytes32,
+    epoch: &BigInt,
+) -> Bytes32 {
+    mirror_hint(store, root, owner.puzzle_hash, epoch)
+}
+
 /// A wallet: the key that signs, and the puzzle hash that owns.
 pub struct Wallet {
     pub public_key: PublicKey,
