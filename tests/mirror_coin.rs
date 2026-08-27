@@ -78,6 +78,26 @@ fn creating_spend(owner: &Wallet, memo_entries: &[Bytes]) -> (CoinSpend, Coin) {
     creating_spend_of_asset(owner, memo_entries, DIG_ASSET_ID)
 }
 
+/// As [`creating_spend`], but locking `amount` rather than the default collateral.
+///
+/// The amount is the ONLY thing that distinguishes two coins of the same owner here: the fixture
+/// derives its parent deterministically from owner, asset and amount, so two spends built with
+/// identical arguments produce a coin with an identical id. A test that needs two genuinely
+/// different coins from one wallet must vary this, or the second `publish` silently overwrites the
+/// first's creating spend and both records resolve to the same coin.
+fn creating_spend_of_amount(
+    owner: &Wallet,
+    memo_entries: &[Bytes],
+    amount: u64,
+) -> (CoinSpend, Coin) {
+    let entries = memo_entries.to_vec();
+    let (spend, children) = creating_spend_of_children(owner, DIG_ASSET_ID, amount, |ctx| {
+        vec![(amount, Memos::Some(ctx.alloc(&entries).unwrap()))]
+    });
+
+    (spend, children[0])
+}
+
 /// As [`creating_spend`], but for an arbitrary CAT — so a test can present collateral that is not
 /// $DIG and watch it be refused.
 fn creating_spend_of_asset(
@@ -462,7 +482,12 @@ fn discover_rejects_a_real_mirror_coin_that_bonds_a_different_root() {
     let mut chain = FakeChain::default();
 
     // Hostile: declares root 2, hinted into root 1's bucket.
-    let (hostile_spend, hostile) = creating_spend(
+    //
+    // The two amounts differ so these are genuinely two coins. The fixture derives its parent from
+    // owner + asset + amount, so building both at the same amount yields ONE coin id and the second
+    // publish overwrites the first's creating spend — leaving a fixture in which the hostile coin
+    // does not exist at all and the rejection below is a coincidence.
+    let (hostile_spend, hostile) = creating_spend_of_amount(
         &peer,
         &declared_memos(
             hint_of(&peer, store_a(), root_1()),
@@ -471,16 +496,22 @@ fn discover_rejects_a_real_mirror_coin_that_bonds_a_different_root() {
             &epoch(),
             &["https://stale.example"],
         ),
+        COLLATERAL,
     );
     chain.publish(hostile_spend, hostile, hint_of(&peer, store_a(), root_1()));
 
     // Honest: declares root 2 and is hinted where root 2 is looked for.
-    let honest = publish_mirror(
-        &mut chain,
+    let (honest_spend, honest) = creating_spend_of_amount(
         &peer,
-        store_a(),
-        root_2(),
-        "https://fresh.example",
+        &mirror_memos(&peer, store_a(), root_2(), &["https://fresh.example"]),
+        COLLATERAL / 2,
+    );
+    chain.publish(honest_spend, honest, hint_of(&peer, store_a(), root_2()));
+
+    assert_ne!(
+        hostile.coin_id(),
+        honest.coin_id(),
+        "the fixture must really hold two different coins"
     );
 
     let asked_for_root_1 = discover(&chain, store_a(), root_1(), peer.puzzle_hash, &epoch())
