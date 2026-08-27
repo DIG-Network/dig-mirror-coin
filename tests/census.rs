@@ -33,7 +33,8 @@ use support::{
 const CENSUS_AT: u32 = 1_000;
 
 /// The requirement coins are qualified against. Chosen so [`AT_REQUIREMENT`] sits exactly on it and
-/// [`BELOW_REQUIREMENT`] sits exactly one mojo under, which is what makes the bound testable from
+/// [`BELOW_REQUIREMENT`] sits exactly one DIG CAT base unit under, which is what makes the bound
+/// testable from
 /// both sides rather than only from the side that happens to pass.
 const REQUIREMENT: u64 = 1_000_000;
 const AT_REQUIREMENT: u64 = REQUIREMENT;
@@ -451,12 +452,12 @@ fn a_coin_below_the_requirement_contributes_to_nothing_while_an_honest_one_still
     assert_eq!(
         census.census().locked,
         AT_REQUIREMENT,
-        "and its mojos are not locked collateral"
+        "and its collateral is not locked collateral"
     );
     assert_eq!(census.excluded().under_collateralised, 1);
 }
 
-/// The bound from the passing side. `BELOW_REQUIREMENT` is one mojo under and
+/// The bound from the passing side. `BELOW_REQUIREMENT` is one base unit under and
 /// `AT_REQUIREMENT` is exactly on it, so a comparison that drifted by one in either direction
 /// fails one of this pair.
 #[test]

@@ -74,7 +74,11 @@ impl MirrorCoin {
         self.inner.proof
     }
 
-    /// The amount of $DIG locked as collateral, in mojos.
+    /// The amount of $DIG locked as collateral, in **DIG CAT base units** — `1 DIG = 1_000`.
+    ///
+    /// Not mojos. A mojo is XCH's base unit at `10^-12` XCH; a DIG CAT base unit is `10^-3` DIG,
+    /// nine orders of magnitude apart. Naming the wrong one here is a money-path error, so the unit
+    /// is stated rather than implied.
     pub fn collateral(&self) -> u64 {
         self.inner.coin.amount
     }

@@ -305,6 +305,10 @@ pub fn census<S: ChainSource>(
             &candidate,
             at.height,
             &qualifying_epoch,
+            // The ONLY place this crate reads a field of `EpochRecord`. `dig-mirror-collateral`
+            // is renaming its `*_mojos` fields for 0.2.0 — a mojo is XCH's base unit and a DIG CAT
+            // base unit is nine orders of magnitude larger — so keeping the read to one line keeps
+            // the adoption a one-line edit rather than a sweep.
             prior.required_per_store_mojos,
             &mut excluded,
         )?
@@ -332,7 +336,9 @@ pub fn census<S: ChainSource>(
     let mut owners: HashSet<Bytes32> = HashSet::new();
     for (triple, selection) in &selected {
         locked = locked.checked_add(selection.amount).ok_or_else(|| {
-            MirrorError::Malformed("locked collateral total overflows u64 mojos".to_string())
+            MirrorError::Malformed(
+                "locked collateral total overflows u64 DIG CAT base units".to_string(),
+            )
         })?;
         owners.insert(triple.owner);
     }
@@ -400,7 +406,7 @@ fn qualify<S: ChainSource>(
     candidate: &CoinRecord,
     census_height: u32,
     qualifying_epoch: &BigInt,
-    required_per_store_mojos: u64,
+    required_per_store: u64,
     excluded: &mut Exclusions,
 ) -> Result<Option<Qualified>, MirrorError> {
     // C2 — created at or before the census height.
@@ -444,7 +450,7 @@ fn qualify<S: ChainSource>(
     }
 
     // C5 — meets that epoch's requirement. Read the module docs before relaxing this.
-    if coin.collateral() < required_per_store_mojos {
+    if coin.collateral() < required_per_store {
         excluded.under_collateralised += 1;
         return Ok(None);
     }

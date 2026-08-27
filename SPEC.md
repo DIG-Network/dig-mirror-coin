@@ -345,7 +345,9 @@ threshold to remove the apparent circularity — doing so reopens §8.3.
 - `owners(n)` — the count of distinct owner puzzle hashes across the qualifying triples. It is **not
   a node count and not an operator count**, and a surface displaying it MUST NOT describe it as
   either.
-- `locked(n)` — the sum of the amounts of the coins selected by C9.
+- `locked(n)` — the sum of the amounts of the coins selected by C9, in **DIG CAT base units**
+  (`1 DIG = 1_000`). These are never mojos: a mojo is XCH's base unit at `10^-12` XCH, nine orders
+  of magnitude away, and an implementation MUST NOT describe a mirror coin's amount as one.
 
 ### 8.6 Finality
 
