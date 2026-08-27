@@ -25,6 +25,13 @@
 //! than enumerating a store's mirrors. Peers come from the DHT; what this crate answers is whether
 //! the collateral behind a peer's claim is real and is staked on the root being asked for.
 //!
+//! ## The census is a fifth read, and a different kind of question
+//!
+//! [`census()`] does not ask what one coin says; it asks what the whole collateralised network looks
+//! like at one block height, and it feeds the per-epoch collateral recurrence in
+//! `dig-mirror-collateral`. Its rules are subtle enough that the module documents each one where it
+//! is enforced — start at the [`mod@census`] module before changing anything there.
+//!
 //! [`list`] and [`discover`] are separate on purpose. They are keyed differently, trusted
 //! differently, and an empty answer means something different in each — see [`query`].
 //!

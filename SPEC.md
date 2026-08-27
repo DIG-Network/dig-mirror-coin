@@ -264,7 +264,110 @@ Per **NC-12**, an answer from a single unauthenticated source is not corroborate
 requires corroboration MUST obtain it by querying several sources, which this crate enables by taking
 the source as a parameter.
 
-## 8. Conformance
+## 8. The census
+
+The per-epoch collateral requirement is a recurrence: what a mirror MUST lock in epoch `n` is derived
+from what the network actually locked in epoch `n-1`. `dig-mirror-collateral` defines the arithmetic
+and reads no chain. This section defines the chain read that produces its inputs.
+
+### 8.1 The census height
+
+The census of epoch `n` is taken at a single **block height** `H(n)`, never at a wall-clock instant:
+every node MUST arrive at the same requirement without coordinating, and only a height is consensus
+data.
+
+`H(n)` is the height of the **first transaction block whose timestamp is at or after the epoch
+start**. Chia block timestamps are in seconds.
+
+**Non-transaction blocks carry no timestamp and MUST be skipped entirely.** They are not candidates
+for `H(n)` and they do not advance the comparison. An implementation MUST NOT select a height that
+carries no timestamp, and MUST NOT interpolate one. A one-block disagreement here is a fork.
+
+A source that answers no timestamp for any height near the search is **not** a chain without blocks.
+An implementation MUST report such a read as unanswerable (§7) and MUST NOT resolve it by guessing.
+
+An epoch start the chain has not yet reached is an **absence**, not an error: an implementation MUST
+report it as an empty answer.
+
+The epoch calendar — the mapping from an epoch number to its start time — is **not defined by this
+crate**. An implementation MUST take the epoch start as an input.
+
+### 8.2 Qualifying coins
+
+A coin at `H(n)` qualifies for the census of epoch `n` when all of the following hold.
+
+- **C1** — it sits at the mirror puzzle hash (§3.1) and its collateral is $DIG.
+- **C2** — it was created at a height less than or equal to `H(n)`.
+- **C3** — it was not spent at any height less than or equal to `H(n)`. A coin spent *after* `H(n)`
+  was locked at the height being counted and MUST still qualify. It follows that the population read
+  MUST include spent coins.
+- **C4** — its declared epoch equals `n-1` **exactly**. A coin declaring an earlier epoch MUST be
+  excluded, and so MUST a coin declaring a later one: pre-posting for a future epoch and padding with
+  a stale coin are both excluded by the same rule.
+- **C5** — its amount is greater than or equal to the requirement of epoch `n-1`.
+- **C6** — its memos parse as a well-formed advertisement (§5).
+- **C7** — the counted unit is the triple `(owner, store, root)`. An implementation MUST NOT count
+  coins.
+- **C8** — the owner is **proven**, never assumed. The owner MUST be taken from the coin's lineage
+  proof, and the coin's declared advertisement MUST reproduce the hint the coin was published under
+  when that owner is substituted into the morph (§4.1). A coin failing this MUST be excluded rather
+  than attributed on a guess.
+- **C9** — where several qualifying coins share one triple, exactly one is selected: the **largest
+  amount**, ties broken by the **lowest coin id compared big-endian bytewise**. Both axes MUST be
+  deterministic, or two nodes compute a different locked total from the same chain.
+
+A coin that cannot be placed in time — one whose confirmation height the source does not know — MUST
+be excluded rather than assumed to fall on either side of `H(n)`.
+
+### 8.3 An under-collateralised coin is invisible
+
+A coin failing **C5** MUST contribute to **nothing**: not the store count, not the owner count, and
+not the locked total.
+
+This is the primary anti-spam property of the design and it MUST NOT be relaxed. The controller reads
+a network failing to meet its requirement as a signal to lower it, so a coin that counted as a
+participant without paying for one would let an attacker drive the requirement down for the price of
+dust. Under-collateralised is not partially collateralised.
+
+### 8.4 The recurrence is well founded, not circular
+
+A coin qualifies for epoch `n` against the requirement of epoch `n-1`, which was derived from the
+census of `n-2`, terminating at the epoch-1 bootstrap constant. This is induction on the epoch number.
+
+An implementation MUST require the record for epoch `n-1` in order to census epoch `n`. It MUST NOT
+qualify coins against the requirement of the epoch being censused, and MUST NOT substitute a cheaper
+threshold to remove the apparent circularity — doing so reopens §8.3.
+
+### 8.5 The three outputs
+
+- `stores(n)` — the count of distinct qualifying triples. It is an advertisement count: one owner
+  publishing two roots of one store contributes two, each paid for in full.
+- `owners(n)` — the count of distinct owner puzzle hashes across the qualifying triples. It is **not
+  a node count and not an operator count**, and a surface displaying it MUST NOT describe it as
+  either.
+- `locked(n)` — the sum of the amounts of the coins selected by C9.
+
+### 8.6 Finality
+
+A census taken at the tip is reorg-sensitive. An implementation MUST NOT publish, gossip, or act on a
+census whose height is within `CENSUS_FINALITY_DEPTH_BLOCKS` of its source's peak; it MUST report the
+epoch as pending instead. A source that exposes no peak cannot establish finality, and an
+implementation MUST refuse to census against one.
+
+### 8.7 A census is complete or it is absent
+
+Unlike `list` (§6.2), a census MUST NOT tolerate an unanswerable read. A census computed over part of
+the population is not a smaller census; it is a different number from the one every other node
+computes, produced silently. An implementation MUST return an error and no census.
+
+A coin that was read successfully and failed a rule is the opposite case: that is an answer, and an
+implementation MUST count it as an exclusion and continue.
+
+An implementation MUST bound the population it examines, and MUST disclose to the caller when that
+bound was reached — a truncated census is a census of an arbitrary prefix of the network and MUST NOT
+be fed to the controller.
+
+## 9. Conformance
 
 An implementation conforms when:
 
@@ -289,4 +392,12 @@ An implementation conforms when:
     every other caller (§6.2), so no stranger can hold the completeness signal false;
 11. memos that decoded and carried no URLs are distinguishable, inside the implementation, from memos
     that could not be decoded at all (§5);
-12. an empty result and an unreachable source are distinguishable by the caller in every verb.
+12. an empty result and an unreachable source are distinguishable by the caller in every verb;
+13. its census excludes a coin below the epoch requirement from ALL THREE outputs while still
+    counting an honest coin beside it (§8.3);
+14. its census counts one triple once however many coins back it, and selects the largest (§8.2 C9);
+15. its census excludes a coin declaring any epoch other than `n-1`, earlier or later (§8.2 C4);
+16. its census excludes a coin whose declaration does not reproduce its hint under the owner from its
+    lineage proof (§8.2 C8);
+17. its census reports an epoch within the finality depth of the tip as pending rather than final
+    (§8.6), and errors rather than shrinking when a read cannot be answered (§8.7).
