@@ -17,17 +17,20 @@ keywords = ["chia", "dig", "cat", "collateral", "mirror"]
 categories = ["cryptography::cryptocurrencies"]
 
 [dependencies]
-dig-chainsource-interface = "0.2"
+dig-chainsource-interface = "0.3.2"
 
-chia-bls = "0.26.0"
-chia-protocol = "0.26.0"
-chia-puzzle-types = "0.26.0"
-chia-puzzles = "0.20.1"
-chia-sdk-driver = { version = "0.30.0", features = ["chip-0035", "action-layer"] }
-chia-sdk-types = { version = "0.30.0", features = ["chip-0035", "action-layer"] }
-clvm-traits = "0.26.0"
-clvm-utils = "0.26.0"
-clvmr = "0.14.0"
+# The chia line is the chia-wallet-sdk ceiling, and the ceiling is NOT one number: the primitives,
+# the SDK crates, `chia-puzzles` and `clvmr` each cap at a different version. Normalising them to a
+# single version would either strand this crate below the SDK or move it past what the SDK can link.
+chia-bls = "0.36.1"
+chia-protocol = "0.36.1"
+chia-puzzle-types = "0.36.1"
+chia-puzzles = "0.20.3"
+chia-sdk-driver = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+chia-sdk-types = { version = "0.36.0", features = ["chip-0035", "action-layer"] }
+clvm-traits = "0.36.1"
+clvm-utils = "0.36.1"
+clvmr = "0.16.2"
 hex-literal = "0.4"
 indexmap = "2.11.4"
 num-bigint = "0.4.6"
