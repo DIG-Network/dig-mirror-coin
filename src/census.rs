@@ -305,10 +305,11 @@ pub fn census<S: ChainSource>(
             &candidate,
             at.height,
             &qualifying_epoch,
-            // The ONLY place this crate reads a field of `EpochRecord`. `dig-mirror-collateral`
-            // is renaming its `*_mojos` fields for 0.2.0 — a mojo is XCH's base unit and a DIG CAT
-            // base unit is nine orders of magnitude larger — so keeping the read to one line keeps
-            // the adoption a one-line edit rather than a sweep.
+            // The only `EpochRecord` field this crate reads whose NAME is changing:
+            // `dig-mirror-collateral` is renaming its `*_mojos` fields for 0.2.0 — a mojo is XCH's
+            // base unit and a DIG CAT base unit is nine orders of magnitude larger — so keeping
+            // this read to one line keeps the adoption a one-line edit rather than a sweep.
+            // (`prior.epoch` is read above as well, but its name is not changing.)
             prior.required_per_store_mojos,
             &mut excluded,
         )?
