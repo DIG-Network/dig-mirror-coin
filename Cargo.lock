@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "dig-mirror-coin"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "chia-bls 0.36.1",
  "chia-protocol",
@@ -739,11 +739,22 @@ dependencies = [
  "clvm-utils",
  "clvmr",
  "dig-chainsource-interface",
+ "dig-mirror-collateral",
  "hex",
  "hex-literal",
  "indexmap",
  "num-bigint",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "dig-mirror-collateral"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1942a9df7f1a9d6f87179630995e84260533c214c18b93ccef58ba8453847c7"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

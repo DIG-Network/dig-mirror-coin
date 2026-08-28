@@ -37,7 +37,8 @@ pub struct MirrorAdvertisement {
     pub epoch: BigInt,
     /// Where the store can be fetched from. MUST be non-empty.
     pub urls: Vec<String>,
-    /// The $DIG locked behind the claim, in mojos. MUST be non-zero.
+    /// The $DIG locked behind the claim, in **DIG CAT base units** (`1 DIG = 1_000`, never
+    /// mojos — see [`MirrorCoin::collateral`](crate::MirrorCoin::collateral)). MUST be non-zero.
     pub collateral: u64,
 }
 

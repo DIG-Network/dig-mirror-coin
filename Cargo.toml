@@ -6,7 +6,7 @@
 # never pulls a network stack down into itself.
 [package]
 name = "dig-mirror-coin"
-version = "0.5.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.81.0"
 description = "Mirror coins: lock $DIG as collateral to advertise a DIG store mirror on Chia — create, list, discover, reclaim"
@@ -16,8 +16,15 @@ readme = "README.md"
 keywords = ["chia", "dig", "cat", "collateral", "mirror"]
 categories = ["cryptography::cryptocurrencies"]
 
+# Agent instructions are not part of the crate. Without this they ride into the published tarball,
+# which is IMMUTABLE — `cargo package --list` showed six `.claude/skills/**/SKILL.md` plus
+# `AGENTS.md` and `CLAUDE.md` shipping to every consumer of 0.7.0. Re-run `cargo package --list`
+# after touching this list; it is the only thing that proves the exclusion still bites.
+exclude = [".claude", "AGENTS.md", "CLAUDE.md"]
+
 [dependencies]
 dig-chainsource-interface = "0.3.2"
+dig-mirror-collateral = "0.3.0"
 
 # The chia line is the chia-wallet-sdk ceiling, and the ceiling is NOT one number: the primitives,
 # the SDK crates, `chia-puzzles` and `clvmr` each cap at a different version. Normalising them to a
@@ -32,9 +39,9 @@ clvm-traits = "0.36.1"
 clvm-utils = "0.36.1"
 clvmr = "0.16.2"
 hex-literal = "0.4"
-indexmap = "2.11.4"
+indexmap = "2.14.0"
 num-bigint = "0.4.6"
-thiserror = "1.0.61"
+thiserror = "2.0.20"
 
 [dev-dependencies]
 hex = "0.4"

@@ -19,6 +19,28 @@ differently, and an empty answer means something different in each: `list` empty
 locked nothing*, `discover` empty means *this peer is not bonded here*. Neither ever reports an
 unreachable chain source as an empty result — that is an error, and callers must fail closed on it.
 
+
+## The census
+
+`census` is a fifth read, and it answers a different kind of question: not *what does this coin
+say*, but *what does the whole collateralised network look like at one block height*. It feeds the
+per-epoch collateral recurrence in
+[`dig-mirror-collateral`](https://crates.io/crates/dig-mirror-collateral), which owns the arithmetic
+and reads no chain.
+
+Three properties are worth knowing before using it, because each one is a rule somebody will
+otherwise be tempted to relax:
+
+- **A coin below the epoch requirement is invisible** — not in the store count, not in the owner
+  count, not in the locked total. The controller reads a struggling network as a signal to lower the
+  requirement, so a dust coin that counted as a participant would let anyone drive the requirement
+  down for free.
+- **It looks circular and is not.** A census for epoch `n` qualifies coins against the requirement of
+  epoch `n-1`, which came from `n-2`, down to a bootstrap constant. `census` takes the *record* for
+  `n-1` for exactly this reason: the induction is in the signature.
+- **A census near the tip is pending, not final.** A reorg can retract it, and an epoch is seven
+  days, so waiting the finality depth costs about ten minutes.
+
 ## A mirror bonds a ROOT, not a store
 
 A store changes, and a publisher funding mirrors has to be able to pay for the current root and
