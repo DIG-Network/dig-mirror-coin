@@ -141,6 +141,24 @@ impl CensusChain {
             coinbase: false,
         });
     }
+
+    /// A block-reward coin at the mirror puzzle hash: a farmer or pool pointed its free-form reward
+    /// target at the shared hash. Its creating spend is deliberately absent from `creating_spends`,
+    /// because no such spend exists on any node.
+    ///
+    /// `flagged` is whether the source populates [`CoinRecord::coinbase`]. Both values are reachable
+    /// in production and they are not interchangeable: a source built from a wallet-protocol
+    /// `CoinState` has no coinbase flag to report and sets it `false` for every reward coin. A
+    /// fixture that only ever set it `true` could not tell a flag-only fix from a correct one.
+    fn publish_block_reward(&mut self, amount: u64, height: u32, flagged: bool) {
+        self.coins.push(CoinRecord {
+            coin: Coin::new(coinbase_parent(height), mirror_coin_puzzle_hash(), amount),
+            confirmed_height: Some(height),
+            spent_height: None,
+            timestamp: None,
+            coinbase: flagged,
+        });
+    }
 }
 
 impl ChainSource for CensusChain {
@@ -453,6 +471,121 @@ fn the_larger_coin_wins_a_triple_whichever_order_the_chain_returns_them_in() {
 }
 
 // ---------------------------------------------------------------------------
+// C0b — a block reward can never be authenticated by anyone
+// ---------------------------------------------------------------------------
+
+/// The parent id consensus synthesises for a reward coin: sixteen bytes of the genesis challenge
+/// followed by the block height as a sixteen-byte big-endian integer
+/// (`chia/consensus/coinbase.py`). It is not the coin id of any coin, so no spend for it exists even
+/// on a perfect, complete, unpruned node.
+///
+/// The prefix is mainnet's real genesis challenge, so the fixture is not merely *some* value with
+/// zero bytes in the right place — it is the value production would see.
+fn coinbase_parent(height: u32) -> Bytes32 {
+    const MAINNET_GENESIS_CHALLENGE_PREFIX: [u8; 16] = [
+        0xcc, 0xd5, 0xbb, 0x71, 0x18, 0x35, 0x32, 0xbf, 0xf2, 0x20, 0xba, 0x46, 0xc2, 0x68, 0x99,
+        0x1a,
+    ];
+
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(&MAINNET_GENESIS_CHALLENGE_PREFIX);
+    bytes[16..].copy_from_slice(&u128::from(height).to_be_bytes());
+    Bytes32::new(bytes)
+}
+
+/// One Chia block reward paid to the mirror puzzle hash used to end every census, at every later
+/// height, on every node, for the price of a farmer config line.
+///
+/// The amount is the real mainnet block reward, 1.75 XCH in mojos, and that choice is the test
+/// rather than decoration: it clears the prescreen's amount filter by nine orders of magnitude, so a
+/// fixture that used dust here would go green against a crate that had no reward rule at all. The
+/// honest coin beside it is the control — if the new rule over-reached and dropped both, `stores`
+/// would be zero rather than one.
+#[test]
+fn a_block_reward_paid_to_the_mirror_hash_cannot_deny_the_census() {
+    const MAINNET_BLOCK_REWARD_MOJOS: u64 = 1_750_000_000_000;
+
+    let mut chain = CensusChain::new();
+    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+    chain.publish_block_reward(MAINNET_BLOCK_REWARD_MOJOS, CENSUS_AT - 10, true);
+
+    let census = take_final(
+        census(&chain, &prior_record(), at(CENSUS_AT))
+            .expect("a free-to-create reward coin must not be able to end the census"),
+    );
+
+    assert_eq!(census.census().stores, 1, "the honest coin still counts");
+    assert_eq!(census.excluded().block_reward, 1);
+    assert_eq!(
+        census.excluded().unreadable,
+        0,
+        "a reward coin is a fact about the chain, not an unreadable mirror coin"
+    );
+}
+
+/// The same coin as reported by a source that has no coinbase flag to give.
+///
+/// `CoinRecord::from_coin_state` sets `coinbase: false` unconditionally, because a wallet-protocol
+/// `CoinState` carries no such field — so every light source reports every reward coin this way.
+/// This is the fixture that separates a flag-only fix from a correct one: a rule reading only
+/// `record.coinbase` passes the test above and fails this one, leaving the denial reachable against
+/// the majority of sources.
+#[test]
+fn a_block_reward_a_light_source_cannot_flag_still_cannot_deny_the_census() {
+    const MAINNET_BLOCK_REWARD_MOJOS: u64 = 1_750_000_000_000;
+
+    let mut chain = CensusChain::new();
+    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+    chain.publish_block_reward(MAINNET_BLOCK_REWARD_MOJOS, CENSUS_AT - 10, false);
+
+    let census = run(&chain);
+
+    assert_eq!(census.census().stores, 1);
+    assert_eq!(census.excluded().block_reward, 1);
+}
+
+/// A reward coin is never spent, so C3 never starts excluding it and the denial it would cause does
+/// not heal with time. Two heights, both after the reward's confirmation, must both answer.
+#[test]
+fn a_block_reward_does_not_deny_later_censuses_either() {
+    const MAINNET_BLOCK_REWARD_MOJOS: u64 = 1_750_000_000_000;
+
+    let mut chain = CensusChain::new();
+    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+    chain.publish_block_reward(MAINNET_BLOCK_REWARD_MOJOS, CENSUS_AT - 100, true);
+    chain.peak = Some(CENSUS_AT + 5_000 + CENSUS_FINALITY_DEPTH_BLOCKS as u32);
+
+    for height in [CENSUS_AT, CENSUS_AT + 5_000] {
+        assert!(
+            census(&chain, &prior_record(), at(height)).is_ok(),
+            "the census at height {height} was denied by a coin that is never spent"
+        );
+    }
+}
+
+/// An ordinary mirror coin whose creating spend the source simply does not hold is NOT a reward
+/// coin, and must still abort. C0b is a carve-out for one shape, not a licence for pruned sources to
+/// report a smaller network.
+///
+/// The parent here is a plausible coin id — no zero run at bytes 16..28 — so it is the near-miss
+/// neighbour of the reward shape rather than a distant one.
+#[test]
+fn an_ordinary_coin_with_no_creating_spend_still_aborts_the_census() {
+    let mut chain = CensusChain::new();
+    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+    chain.publish_without_creating_spend(Coin::new(
+        Bytes32::new([0xEE; 32]),
+        mirror_coin_puzzle_hash(),
+        ABOVE_REQUIREMENT,
+    ));
+
+    assert!(
+        census(&chain, &prior_record(), at(CENSUS_AT)).is_err(),
+        "a pruned source must still not be able to report a smaller network"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // C5 — the anti-spam rule, from both sides
 // ---------------------------------------------------------------------------
 
@@ -485,7 +618,49 @@ fn a_coin_below_the_requirement_contributes_to_nothing_while_an_honest_one_still
         AT_REQUIREMENT,
         "and its collateral is not locked collateral"
     );
-    assert_eq!(census.excluded().under_collateralised, 1);
+    assert_eq!(
+        census.excluded().below_requirement_unauthenticated,
+        1,
+        "the cheap filter caught it, so it never reached C1 and its asset was never established"
+    );
+    assert_eq!(
+        census.excluded().under_collateralised,
+        0,
+        "C5 is measured behind C1 and this coin never got there"
+    );
+}
+
+/// The counters must not be interchangeable, and one fixture holding both populations is the only
+/// way to see that they are not.
+///
+/// The XCH coin costs one mojo below the requirement — nine orders of magnitude cheaper per unit
+/// than a DIG base unit — and anyone can mint them by the thousand. If it were counted into
+/// `under_collateralised`, that field's own rustdoc would be false: it promises a count measured
+/// against the AUTHENTICATED coin, which is what an operator reads as "$DIG holders are falling
+/// short". The honest mirror coin beside it is the second actor: a single-counter implementation
+/// makes the two indistinguishable, and only a fixture holding both can tell.
+#[test]
+fn an_xch_coin_below_the_requirement_is_not_counted_as_under_collateralised_dig() {
+    let mut chain = CensusChain::new();
+    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+
+    let (spend, coins) =
+        xch_spend_paying_the_mirror_hash(&wallet(3), ABOVE_REQUIREMENT * 4, &[BELOW_REQUIREMENT]);
+    chain.publish(spend, coins[0], CENSUS_AT - 5, None);
+
+    let census = run(&chain);
+
+    assert_eq!(census.census().stores, 1, "the honest coin still counts");
+    assert_eq!(
+        census.excluded().below_requirement_unauthenticated,
+        1,
+        "the XCH coin is noise at the shared puzzle hash"
+    );
+    assert_eq!(
+        census.excluded().under_collateralised,
+        0,
+        "and it is emphatically not an authenticated $DIG coin that fell short"
+    );
 }
 
 /// The bound from the passing side. `BELOW_REQUIREMENT` is one base unit under and
@@ -796,7 +971,7 @@ fn a_dust_coin_with_no_creating_spend_is_screened_before_any_spend_is_fetched() 
     let census = run(&chain);
 
     assert_eq!(census.census().stores, 1, "the honest coin still counts");
-    assert_eq!(census.excluded().under_collateralised, 1);
+    assert_eq!(census.excluded().below_requirement_unauthenticated, 1);
     assert_eq!(
         census.excluded().unreadable,
         0,
@@ -923,11 +1098,16 @@ fn a_bigint_epoch_is_compared_against_the_records_epoch_and_not_its_length() {
 /// bound test built on it therefore certified the hole it was meant to close: the coins have no
 /// creating spend at all, so what it proved was that a coin needs an INTEGER to consume the bound,
 /// not collateral.
+///
+/// The fabricated parents fill all 32 bytes rather than leaving a run of zeroes, because a real
+/// parent is a coin id and C0b now reads the shape of one: a parent whose bytes 16..28 are zero is
+/// the consensus coinbase construction, and a fixture that accidentally produced it would be
+/// excluded as a block reward instead of reaching the expensive pass this helper exists to reach.
 fn flood(chain: &mut CensusChain, count: usize, amount: u64) {
     for index in 0..count {
-        let mut parent = [0u8; 32];
+        let mut parent = [0xF1u8; 32];
         parent[..8].copy_from_slice(&(index as u64).to_be_bytes());
-        parent[31] = 0xF1;
+        parent[24..].copy_from_slice(&(index as u64).to_be_bytes());
         chain.publish_without_creating_spend(Coin::new(
             Bytes32::new(parent),
             mirror_coin_puzzle_hash(),

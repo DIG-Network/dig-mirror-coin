@@ -90,6 +90,15 @@ pub struct Exclusions {
     /// for. A fact about the source, not about the chain; nothing else here would have been safe to
     /// read off such a record.
     pub foreign_puzzle: u64,
+    /// **C0b** — a block-reward coin, which has no creating spend on *any* source and therefore
+    /// could never be authenticated by anyone.
+    ///
+    /// Distinct from [`unreadable`](Self::unreadable) and from the abort a missing spend otherwise
+    /// causes: those describe what a particular source could answer, this describes the chain. A
+    /// non-zero count here means someone is paying farming rewards to the mirror puzzle hash — which
+    /// is free to do and says nothing about the collateralised network, so it is reported rather
+    /// than allowed to end the census.
+    pub block_reward: u64,
     /// **C2** — created after the census height, so not yet part of the network being counted.
     pub not_yet_created: u64,
     /// **C3** — already spent at or before the census height.
@@ -103,8 +112,34 @@ pub struct Exclusions {
     /// See the module docs: these are invisible, never evidence.
     ///
     /// Only ever counted behind C1, because an amount whose asset is unknown is a number without a
-    /// unit and cannot be compared against a threshold denominated in DIG CAT base units.
+    /// unit and cannot be compared against a threshold denominated in DIG CAT base units. The cheap
+    /// filter that runs before C1 counts into
+    /// [`below_requirement_unauthenticated`](Self::below_requirement_unauthenticated) instead, and
+    /// the two are kept apart because only one of them is about $DIG.
+    ///
+    /// **What actually reaches here, stated so nobody reads more into it than it carries.** The
+    /// prescreen has already discarded every record whose amount is below the requirement, so a coin
+    /// arriving at C1 has `record.amount >= required`. It can then fail C5 only if its authenticated
+    /// collateral differs from the amount its record advertised — that is, the source *misreported*
+    /// the amount. So this counts sources caught lying about an amount, not honest mirrors that fell
+    /// short.
+    ///
+    /// **Neither counter is the "the network cannot afford the requirement" signal**, and this crate
+    /// does not produce one. An honest mirror below the requirement is indistinguishable, without a
+    /// chain read, from an XCH `CREATE_COIN` paying one mojo to the same puzzle hash; both land in
+    /// the unauthenticated counter. Reading either as hardship is the mistake the module docs warn
+    /// about, because the cheaper of those two shapes is the one an attacker mass-produces.
     pub under_collateralised: u64,
+    /// Discarded by the cheap prescreen filter for carrying a record amount below the requirement,
+    /// **before** any chain read and therefore **before the asset is established**.
+    ///
+    /// Not C5 and deliberately not folded into [`under_collateralised`](Self::under_collateralised).
+    /// The asset behind these amounts is unknown: an ordinary XCH `CREATE_COIN` paying the mirror
+    /// puzzle hash one mojo below the requirement lands here, nine orders of magnitude cheaper per
+    /// unit than a DIG base unit. Anyone can drive this counter arbitrarily high for approximately
+    /// nothing, so it is a measure of noise at the shared puzzle hash and never evidence about the
+    /// collateralised network.
+    pub below_requirement_unauthenticated: u64,
     /// **C1/C6** — not a mirror coin at all, or its memos could not be read: a sibling collateral
     /// coin, a stranger's dust, collateral in some other asset, or an absent creating spend.
     pub unreadable: u64,
@@ -477,7 +512,8 @@ struct Qualified {
     selection: Selection,
 }
 
-/// Applies the rules whose inputs are already on the coin record: **C0** and **C2**, **C3**.
+/// Applies the rules whose inputs are already on the coin record: **C0**, **C0b**, **C2** and
+/// **C3**.
 ///
 /// `true` keeps the candidate for the expensive pass; `false` excludes it and records why.
 ///
@@ -490,6 +526,7 @@ struct Qualified {
 /// | comparison | left operand | right operand | established? |
 /// |---|---|---|---|
 /// | **C0** `puzzle_hash == mirror_coin_puzzle_hash()` | the source's record | this crate's own constant | yes |
+/// | **C0b** `!is_block_reward(candidate)` | the source's record and the parent's shape | the consensus coinbase construction | yes |
 /// | **C2** `confirmed_height <= census_height` | a block height on the source's chain | a block height on the same chain | yes |
 /// | **C3** `spent_height > census_height` | a block height on the source's chain | a block height on the same chain | yes |
 /// | *(filter)* `amount >= required_per_store` | a `u64` in **an unknown asset** | DIG CAT base units | **NO** |
@@ -537,6 +574,12 @@ fn prescreen(
         return false;
     }
 
+    // C0b — a block-reward coin, which no source can ever authenticate.
+    if is_block_reward(candidate) {
+        excluded.block_reward += 1;
+        return false;
+    }
+
     // C2 — created at or before the census height.
     let Some(confirmed) = candidate.confirmed_height else {
         excluded.undated += 1;
@@ -557,15 +600,57 @@ fn prescreen(
         return false;
     }
 
-    // A one-directional filter, NOT C5. See the operand table above: this number's asset is unknown,
-    // so passing it establishes nothing. Failing it does, because a qualifying coin's collateral IS
-    // its record amount — so this can only discard coins C5 would discard anyway.
+    // A one-directional filter, NOT C5, and counted separately from it for that reason. See the
+    // operand table above: this number's asset is unknown, so passing it establishes nothing.
+    // Failing it does, because a qualifying coin's collateral IS its record amount — so this can
+    // only discard coins C5 would discard anyway.
     if candidate.coin.amount < required_per_store {
-        excluded.under_collateralised += 1;
+        excluded.below_requirement_unauthenticated += 1;
         return false;
     }
 
     true
+}
+
+/// Whether a record is a **block-reward** (coinbase) coin: farmer or pool reward.
+///
+/// # Why this is a rule of its own and not a case of "the source could not answer"
+///
+/// Everywhere else in this module an absent creating spend is treated as a gap in the *source*, and
+/// it aborts the census on purpose: a pruned source that silently omits spends would otherwise
+/// report a smaller network, which is the direction that lowers the requirement for everyone.
+///
+/// A reward coin is the one shape where that reasoning is simply false. Chia synthesises its
+/// `parent_coin_info` (`chia/consensus/coinbase.py`: sixteen bytes of the genesis challenge followed
+/// by the block height as a sixteen-byte big-endian integer), so it is not the coin id of any coin
+/// and **no spend for it exists on a perfect, complete, unpruned node, ever**. Waiting for a better
+/// source cannot help, because there is no better source. Failing closed on it therefore does not
+/// protect anything; it converts a free action into a permanent denial.
+///
+/// Free, and permanent. `farmer_reward_target_puzzle_hash` is free-form farmer or pool config
+/// validated against nothing, so pointing it at [`mirror_coin_puzzle_hash`] costs one block. The
+/// resulting coin clears C0, C2 and C3, clears the amount filter by nine orders of magnitude, is
+/// never spent so C3 never starts excluding it, and is very likely unspendable at all — the mirror
+/// puzzle hash is a CAT-wrapped `P2ParentCoin` whose authority needs a lineage proof a reward coin
+/// cannot produce. Every census at every later height, on every node, would return `Err`, and
+/// `EpochRecord::advance` would never run again.
+///
+/// # Two detectors, because the flag is not always populated
+///
+/// [`CoinRecord::coinbase`] is authoritative where a source fills it in. It is not always filled in:
+/// `CoinRecord::from_coin_state` sets it to `false` unconditionally, because a wallet-protocol
+/// `CoinState` carries no such flag — so a light source reports every reward coin as `coinbase:
+/// false` while knowing no better.
+///
+/// The synthetic parent's *shape* covers that case without needing the genesis challenge, and so
+/// without pinning this crate to one network: whichever half of the challenge is used, the last
+/// sixteen bytes are a block height, so bytes 16..28 are zero for every height below 2^96. A real
+/// parent is a coin id — a SHA-256 output — so a genuine mirror coin matching this costs an attacker
+/// a 96-bit grind against a hash they do not control the preimage of. That is why the test is safe
+/// in the one direction that matters: it can only ever discard a coin, and the coins it discards
+/// could not have qualified.
+fn is_block_reward(candidate: &CoinRecord) -> bool {
+    candidate.coinbase || candidate.coin.parent_coin_info[16..28] == [0u8; 12]
 }
 
 /// Applies the rules that need the coin's creating spend: **C1/C6**, **C4** and **C8**.
