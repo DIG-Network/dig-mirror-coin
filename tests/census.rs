@@ -21,6 +21,7 @@ use chia_protocol::{Bytes, Bytes32, Coin, CoinSpend};
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_mirror_coin::{
     census, census_height, mirror_coin_puzzle_hash, CensusOutcome, MirrorCensus, MirrorError,
+    MAX_CANDIDATES,
 };
 use dig_mirror_collateral::{EpochCensus, EpochRecord, CENSUS_FINALITY_DEPTH_BLOCKS};
 use num_bigint::BigInt;
@@ -206,7 +207,7 @@ fn take_final(outcome: CensusOutcome) -> MirrorCensus {
             limit,
             ..
         } => panic!(
-            "expected a final census; got Incomplete: {authenticable} of {candidates} candidates needed authenticating, over the limit of {limit}"
+            "expected a final census; got Incomplete: {authenticable} of {candidates} over {limit}"
         ),
     }
 }
@@ -750,7 +751,7 @@ fn a_coin_whose_creating_spend_the_source_cannot_produce_aborts_the_census() {
 
     assert!(
         outcome.is_err(),
-        "a pruned source must not be able to report a smaller network;          got a completed census instead"
+        "a pruned source must not be able to report a smaller network"
     );
 }
 
@@ -880,5 +881,152 @@ fn a_bigint_epoch_is_compared_against_the_records_epoch_and_not_its_length() {
         epoch(),
         BigInt::from(42),
         "the fixture epoch is the record's epoch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// G1 - the candidate population is globally writable, so the bound must refuse
+// ---------------------------------------------------------------------------
+
+/// Publishes `count` distinct coins at the shared mirror puzzle hash, each of `amount`, with no
+/// creating spend.
+///
+/// No creating spend is needed because nothing in these tests is meant to reach `authenticate`:
+/// coins below the requirement are screened out before it, and a population over the bound is
+/// refused before it. A fixture that had to mint ten thousand genuine CAT spends would be testing
+/// the fixture builder.
+fn flood(chain: &mut CensusChain, count: usize, amount: u64) {
+    for index in 0..count {
+        let mut parent = [0u8; 32];
+        parent[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        parent[31] = 0xF1;
+        chain.publish_without_creating_spend(Coin::new(
+            Bytes32::new(parent),
+            mirror_coin_puzzle_hash(),
+            amount,
+        ));
+    }
+}
+
+/// The attack the bound exists to stop, and the reason it must not be a prefix.
+///
+/// Dust is free to publish and the population never shrinks, so if the bound kept the first
+/// `MAX_CANDIDATES` coins, `MAX_CANDIDATES + 1` dust coins would erase an honest network from every
+/// node permanently. The honest coin here is published LAST, which under a prefix cap is exactly
+/// the position that makes it invisible.
+#[test]
+fn a_dust_flood_larger_than_the_bound_does_not_hide_an_honest_coin_published_after_it() {
+    let mut chain = CensusChain::new();
+    flood(&mut chain, MAX_CANDIDATES + 1, BELOW_REQUIREMENT);
+    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+
+    let census = run(&chain);
+
+    assert_eq!(
+        census.census().stores,
+        1,
+        "the honest coin sat past the old prefix cap and would have been erased"
+    );
+    assert_eq!(census.census().owners, 1);
+    assert_eq!(census.census().locked, AT_REQUIREMENT);
+    assert_eq!(
+        census.examined(),
+        MAX_CANDIDATES + 2,
+        "every candidate is examined, not a prefix of them"
+    );
+}
+
+/// The same chain in the other order must give the same answer.
+///
+/// This is the fork half of the finding rather than the censorship half: under a prefix cap these
+/// two orderings of one chain produced `stores = 1` and `stores = 0`, so two nodes reading the same
+/// chain through sources that enumerate differently would compute different requirements.
+#[test]
+fn the_census_is_the_same_whichever_end_of_a_dust_flood_the_honest_coin_sits_at() {
+    let mut last = CensusChain::new();
+    flood(&mut last, MAX_CANDIDATES + 1, BELOW_REQUIREMENT);
+    publish_qualifying(&mut last, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+
+    let mut first = CensusChain::new();
+    publish_qualifying(&mut first, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+    flood(&mut first, MAX_CANDIDATES + 1, BELOW_REQUIREMENT);
+
+    assert_eq!(
+        run(&last).census(),
+        run(&first).census(),
+        "enumeration order must not change the network every node computes"
+    );
+}
+
+/// Over the bound, the census refuses rather than answering, and says what it saw.
+///
+/// The flood is AT the requirement so it survives the cheap screen and genuinely reaches the
+/// expensive pass's bound - dust would be rejected earlier and could never exercise this path.
+#[test]
+fn a_population_over_the_bound_is_refused_rather_than_truncated() {
+    let mut chain = CensusChain::new();
+    flood(&mut chain, MAX_CANDIDATES + 1, AT_REQUIREMENT);
+
+    let outcome =
+        census(&chain, &prior_record(), at(CENSUS_AT)).expect("the read itself was answerable");
+
+    match outcome {
+        CensusOutcome::Incomplete {
+            census_height,
+            candidates,
+            authenticable,
+            limit,
+        } => {
+            assert_eq!(census_height, CENSUS_AT);
+            assert_eq!(candidates, MAX_CANDIDATES + 1);
+            assert_eq!(authenticable, MAX_CANDIDATES + 1);
+            assert_eq!(limit, MAX_CANDIDATES);
+        }
+        CensusOutcome::Final(census) => panic!(
+            "a census over the bound must not be Final; got stores = {}",
+            census.census().stores
+        ),
+        CensusOutcome::Pending { .. } => panic!("the peak is far past the census height"),
+    }
+}
+
+/// The other side of the same bound: exactly `MAX_CANDIDATES` authenticable coins is NOT refused.
+///
+/// It proceeds into the expensive pass and fails there instead - on the missing creating spends
+/// these fixtures deliberately have - which is a different outcome from `Incomplete` and is what
+/// distinguishes an at-bound population from an over-bound one. A bound asserted only from above
+/// is equally satisfied by a bound that refuses everything.
+#[test]
+fn a_population_exactly_at_the_bound_is_not_refused() {
+    let mut chain = CensusChain::new();
+    flood(&mut chain, MAX_CANDIDATES, AT_REQUIREMENT);
+
+    match census(&chain, &prior_record(), at(CENSUS_AT)) {
+        Ok(CensusOutcome::Incomplete { .. }) => {
+            panic!("a population exactly at the bound is within it, not over it")
+        }
+        Ok(_) => panic!(
+            "these coins have no creating spend, so the expensive pass was reached and must fail"
+        ),
+        Err(_) => {}
+    }
+}
+
+/// Dust does not consume the bound, because the bound governs the expensive pass alone.
+///
+/// This is what makes exhaustive enumeration affordable and is the load-bearing half of running the
+/// cheap rules first: a flood far larger than `MAX_CANDIDATES` still leaves an honest census.
+#[test]
+fn dust_does_not_consume_the_bound_it_is_screened_before_it() {
+    let mut chain = CensusChain::new();
+    flood(&mut chain, MAX_CANDIDATES * 2, BELOW_REQUIREMENT);
+    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+
+    let census = run(&chain);
+
+    assert_eq!(census.census().stores, 1);
+    assert_eq!(
+        census.excluded().under_collateralised as usize,
+        MAX_CANDIDATES * 2
     );
 }
