@@ -116,7 +116,6 @@ pub struct MirrorCensus {
     height: u32,
     examined: usize,
     excluded: Exclusions,
-    truncated: bool,
 }
 
 impl MirrorCensus {
@@ -132,6 +131,9 @@ impl MirrorCensus {
     }
 
     /// How many candidate coins were examined at the shared mirror puzzle hash.
+    ///
+    /// Every coin paying to that puzzle hash is examined: a [`CensusOutcome::Final`] is always a
+    /// census of the whole population, never of a prefix of it.
     pub fn examined(&self) -> usize {
         self.examined
     }
@@ -141,18 +143,14 @@ impl MirrorCensus {
         self.excluded
     }
 
-    /// Whether the population exceeded [`MAX_CANDIDATES`] and the scan stopped early.
-    ///
-    /// A truncated census is **not** a census of the network — it is a census of an arbitrary prefix
-    /// of it, and two nodes reading the same chain may take different prefixes. A caller MUST NOT
-    /// feed one to the controller. It is surfaced rather than hidden because a flood large enough to
-    /// trip this is exactly what an attacker would want to happen quietly.
-    pub fn is_truncated(&self) -> bool {
-        self.truncated
-    }
 }
 
-/// The outcome of asking for a census: either a final one, or a refusal to be premature.
+/// The outcome of asking for a census: a final one, or a refusal to answer.
+///
+/// The two refusals are deliberate and are the only alternatives to [`Self::Final`]. A census that
+/// covered part of the population, or that was taken too close to the tip, would still be *a
+/// number* — and a wrong number arrived at silently is the failure mode this enum exists to make
+/// impossible. Refusing is visible; a smaller network is not.
 #[derive(Debug, Clone)]
 pub enum CensusOutcome {
     /// The census height is too close to the tip for the answer to be safe to act on.
@@ -167,7 +165,31 @@ pub enum CensusOutcome {
         peak_height: u32,
     },
 
-    /// A census taken far enough behind the tip to be acted on.
+    /// The population is too large to authenticate within [`MAX_CANDIDATES`], so no census was
+    /// computed.
+    ///
+    /// This is a **refusal, not a truncation**, and the difference is the whole point. The mirror
+    /// puzzle hash is a single global constant that anyone may pay a coin to, so the candidate
+    /// population is attacker-writable and — because spent coins are included — never shrinks. A
+    /// bound that silently kept a prefix would let anyone censor the census permanently, and two
+    /// nodes keeping *different* prefixes of the same chain would fork. So the node says it cannot
+    /// compute the network rather than computing a smaller one.
+    ///
+    /// Reaching this requires `limit` coins that each already meet the epoch requirement in full —
+    /// the cheap rules are applied to the entire population first, so dust cannot get here.
+    Incomplete {
+        /// The height the census would have been taken at.
+        census_height: u32,
+        /// How many coins pay to the shared mirror puzzle hash in total.
+        candidates: usize,
+        /// How many of those survived the cheap rules and would have needed authenticating.
+        authenticable: usize,
+        /// The bound that was exceeded, [`MAX_CANDIDATES`].
+        limit: usize,
+    },
+
+    /// A census of the **whole** candidate population, taken far enough behind the tip to be acted
+    /// on.
     Final(Box<MirrorCensus>),
 }
 
@@ -293,24 +315,44 @@ pub fn census<S: ChainSource>(
         .coin_records_by_puzzle_hash(mirror_coin_puzzle_hash(), true)
         .map_err(unavailable)?;
 
-    let truncated = candidates.len() > MAX_CANDIDATES;
-    let examined = candidates.len().min(MAX_CANDIDATES);
+    let examined = candidates.len();
     let mut excluded = Exclusions::default();
     let mut selected: BTreeMap<Triple, Selection> = BTreeMap::new();
     let qualifying_epoch = BigInt::from(prior.epoch);
+    // The only `EpochRecord` field this crate reads whose NAME is changing: `dig-mirror-collateral`
+    // is renaming its `*_mojos` fields for 0.2.0 — a mojo is XCH's base unit and a DIG CAT base unit
+    // is nine orders of magnitude larger — so keeping this read to one line keeps the adoption a
+    // one-line edit rather than a sweep. (`prior.epoch` is read above as well; its name is not.)
+    let required_per_store = prior.required_per_store_mojos;
 
-    for candidate in candidates.into_iter().take(MAX_CANDIDATES) {
+    // Pass one, over the ENTIRE population: the rules whose inputs are already on the coin record.
+    // No chain read, no CLVM. This is what makes exhaustive enumeration affordable — dust is
+    // rejected on a `u64` comparison, so a flood buys an attacker no work beyond the read the source
+    // already performed to answer at all.
+    let authenticable: Vec<CoinRecord> = candidates
+        .into_iter()
+        .filter(|candidate| prescreen(candidate, at.height, required_per_store, &mut excluded))
+        .collect();
+
+    // Only the expensive pass is bounded, and it is bounded by a REFUSAL rather than a prefix. See
+    // `CensusOutcome::Incomplete`: keeping a prefix of an attacker-writable set is a censorship
+    // primitive, and a prefix two nodes may choose differently is a fork.
+    if authenticable.len() > MAX_CANDIDATES {
+        return Ok(CensusOutcome::Incomplete {
+            census_height: at.height,
+            candidates: examined,
+            authenticable: authenticable.len(),
+            limit: MAX_CANDIDATES,
+        });
+    }
+
+    // Pass two: the rules that need the creating spend.
+    for candidate in &authenticable {
         let Some(qualified) = qualify(
             source,
-            &candidate,
-            at.height,
+            candidate,
             &qualifying_epoch,
-            // The only `EpochRecord` field this crate reads whose NAME is changing:
-            // `dig-mirror-collateral` is renaming its `*_mojos` fields for 0.2.0 — a mojo is XCH's
-            // base unit and a DIG CAT base unit is nine orders of magnitude larger — so keeping
-            // this read to one line keeps the adoption a one-line edit rather than a sweep.
-            // (`prior.epoch` is read above as well, but its name is not changing.)
-            prior.required_per_store_mojos,
+            required_per_store,
             &mut excluded,
         )?
         else {
@@ -344,7 +386,8 @@ pub fn census<S: ChainSource>(
         owners.insert(triple.owner);
     }
 
-    // Both counts are bounded by `MAX_CANDIDATES`, so neither conversion can be lossy.
+    // Both counts are bounded by `MAX_CANDIDATES` — an entry exists only for a candidate that
+    // survived the expensive pass — so neither conversion can be lossy.
     let census = EpochCensus {
         epoch,
         stores: selected.len() as u64,
@@ -357,7 +400,6 @@ pub fn census<S: ChainSource>(
         height: at.height,
         examined,
         excluded,
-        truncated,
     })))
 }
 
@@ -398,26 +440,33 @@ struct Qualified {
     selection: Selection,
 }
 
-/// Applies rules C1 through C8 to one candidate.
+/// Applies the rules whose inputs are already on the coin record: **C2**, **C3** and **C5**.
 ///
-/// `Ok(None)` means the coin was read and did not qualify — the reason is recorded in `excluded`.
-/// `Err` means a read could not be answered, which ends the census.
-fn qualify<S: ChainSource>(
-    source: &S,
+/// `true` keeps the candidate for the expensive pass; `false` excludes it and records why.
+///
+/// Running these first is not merely an optimisation. `authenticate` costs a chain read and two CLVM
+/// executions, and the candidate list is a globally writable set — so screening on data already in
+/// hand is what keeps a dust flood from buying quadratic work on every node, every epoch, forever.
+///
+/// C5 is decidable here because a mirror coin's collateral **is** its coin amount
+/// ([`MirrorCoin::collateral`](crate::MirrorCoin::collateral) returns `coin.amount`), which the
+/// record already carries. `qualify` re-checks that equality against the authenticated coin rather
+/// than assuming it, so a source that reported a different amount than the spend creates cannot slip
+/// an under-collateralised coin past the cheap screen.
+fn prescreen(
     candidate: &CoinRecord,
     census_height: u32,
-    qualifying_epoch: &BigInt,
     required_per_store: u64,
     excluded: &mut Exclusions,
-) -> Result<Option<Qualified>, MirrorError> {
+) -> bool {
     // C2 — created at or before the census height.
     let Some(confirmed) = candidate.confirmed_height else {
         excluded.undated += 1;
-        return Ok(None);
+        return false;
     };
     if confirmed > census_height {
         excluded.not_yet_created += 1;
-        return Ok(None);
+        return false;
     }
 
     // C3 — not spent at or before the census height. A coin spent AFTER it was locked at the height
@@ -427,15 +476,44 @@ fn qualify<S: ChainSource>(
         .is_some_and(|spent| spent <= census_height)
     {
         excluded.spent_by_census_height += 1;
-        return Ok(None);
+        return false;
     }
 
+    // C5 — meets that epoch's requirement. Read the module docs before relaxing this.
+    if candidate.coin.amount < required_per_store {
+        excluded.under_collateralised += 1;
+        return false;
+    }
+
+    true
+}
+
+/// Applies the rules that need the coin's creating spend: **C1/C6**, **C4** and **C8**.
+///
+/// Only ever called on a candidate `prescreen` kept, so C2, C3 and C5 already hold.
+///
+/// `Ok(None)` means the coin was read and did not qualify — the reason is recorded in `excluded`.
+/// `Err` means a read could not be answered, which ends the census.
+fn qualify<S: ChainSource>(
+    source: &S,
+    candidate: &CoinRecord,
+    qualifying_epoch: &BigInt,
+    required_per_store: u64,
+    excluded: &mut Exclusions,
+) -> Result<Option<Qualified>, MirrorError> {
     // C1/C6 — a $DIG mirror coin whose memos read, re-derived from its creating spend rather than
     // taken from an index.
+    //
+    // `Unauthenticated` is deliberately NOT tolerated here, unlike in `list`. It means the source
+    // returned no creating spend — a gap in the SOURCE, not a fact about the chain, and one that
+    // `skip_reason` itself documents as something a better source may answer differently. Folding it
+    // into `unreadable` would let a pruned source silently report a smaller network, which is the
+    // direction that lowers the requirement for everyone, with no attacker involved. A census is
+    // complete or absent.
     let coin = match authenticate(source, candidate) {
         Ok(Candidate::Mirror(mirror)) => *mirror,
         Ok(Candidate::NotAMirror | Candidate::UndecodableMemos { .. })
-        | Err(MirrorError::NotDigCollateral { .. } | MirrorError::Unauthenticated { .. })
+        | Err(MirrorError::NotDigCollateral { .. })
         | Err(MirrorError::Malformed(_)) => {
             excluded.unreadable += 1;
             return Ok(None);
@@ -443,16 +521,17 @@ fn qualify<S: ChainSource>(
         Err(reason) => return Err(reason),
     };
 
+    // The equality `prescreen` relied on, checked rather than assumed: the amount the record carried
+    // is the amount the creating spend actually produced.
+    if coin.collateral() != candidate.coin.amount || coin.collateral() < required_per_store {
+        excluded.under_collateralised += 1;
+        return Ok(None);
+    }
+
     // C4 — declares exactly the epoch being qualified against. Not "at least": a coin posted for a
     // future epoch must not manufacture a signal in this one, and a stale coin must not pad it.
     if coin.epoch() != qualifying_epoch {
         excluded.wrong_epoch += 1;
-        return Ok(None);
-    }
-
-    // C5 — meets that epoch's requirement. Read the module docs before relaxing this.
-    if coin.collateral() < required_per_store {
-        excluded.under_collateralised += 1;
         return Ok(None);
     }
 

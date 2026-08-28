@@ -200,6 +200,14 @@ fn take_final(outcome: CensusOutcome) -> MirrorCensus {
         } => panic!(
             "expected a final census; got Pending at {census_height} with peak {peak_height}"
         ),
+        CensusOutcome::Incomplete {
+            candidates,
+            authenticable,
+            limit,
+            ..
+        } => panic!(
+            "expected a final census; got Incomplete: {authenticable} of {candidates} candidates needed authenticating, over the limit of {limit}"
+        ),
     }
 }
 
@@ -722,20 +730,55 @@ fn attribution_follows_the_lineage_proof_and_not_the_declaration() {
 // C1/C6 — unreadable coins, and the difference between an answer and its absence
 // ---------------------------------------------------------------------------
 
+/// G2. A creating spend the source cannot produce is a gap in the SOURCE, not a fact about the
+/// chain, so it must abort the census rather than shrink it.
+///
+/// The coin is published AT the requirement deliberately: below it the cheap screen would reject it
+/// before any spend was fetched, and the test would pass while never reaching the path it names.
+/// The honest coin beside it is the control — the census is refused, not merely emptied.
 #[test]
-fn a_coin_with_no_creating_spend_is_excluded_and_the_census_still_completes() {
+fn a_coin_whose_creating_spend_the_source_cannot_produce_aborts_the_census() {
     let mut chain = CensusChain::new();
     publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
     chain.publish_without_creating_spend(Coin::new(
         Bytes32::new([0xEE; 32]),
         mirror_coin_puzzle_hash(),
-        1,
+        AT_REQUIREMENT,
+    ));
+
+    let outcome = census(&chain, &prior_record(), at(CENSUS_AT));
+
+    assert!(
+        outcome.is_err(),
+        "a pruned source must not be able to report a smaller network;          got a completed census instead"
+    );
+}
+
+/// The same shape one base unit below the requirement never reaches a chain read at all: C5 is
+/// decided from the coin record, so the coin is counted as under-collateralised rather than
+/// unreadable, and the census completes.
+///
+/// This is the ordering witness for R1. Before the cheap rules ran first, this coin was fetched,
+/// failed to authenticate, and landed in `unreadable`.
+#[test]
+fn a_dust_coin_with_no_creating_spend_is_screened_before_any_spend_is_fetched() {
+    let mut chain = CensusChain::new();
+    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+    chain.publish_without_creating_spend(Coin::new(
+        Bytes32::new([0xEE; 32]),
+        mirror_coin_puzzle_hash(),
+        AT_REQUIREMENT - 1,
     ));
 
     let census = run(&chain);
 
-    assert_eq!(census.census().stores, 1);
-    assert_eq!(census.excluded().unreadable, 1);
+    assert_eq!(census.census().stores, 1, "the honest coin still counts");
+    assert_eq!(census.excluded().under_collateralised, 1);
+    assert_eq!(
+        census.excluded().unreadable,
+        0,
+        "the dust coin's absent creating spend was never fetched, so it cannot read as unreadable"
+    );
 }
 
 #[test]
