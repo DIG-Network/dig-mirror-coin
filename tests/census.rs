@@ -51,6 +51,10 @@ const ABOVE_REQUIREMENT: u64 = REQUIREMENT + 500;
 fn prior_record() -> EpochRecord {
     EpochRecord {
         epoch: 42,
+        // Taken from the bootstrap record rather than written as a literal: the census does not
+        // interpret the protocol version, and a fixture that pinned one would have to be edited
+        // every time the schedule moves without any of these tests being about it.
+        protocol_version: EpochRecord::bootstrap().protocol_version,
         census: EpochCensus {
             epoch: 42,
             stores: 0,
@@ -60,9 +64,9 @@ fn prior_record() -> EpochRecord {
         signals: None,
         band: None,
         multiplier_micros: 1_000_000,
-        handicap_mojos: 0,
-        base_mojos: REQUIREMENT,
-        required_per_store_mojos: REQUIREMENT,
+        handicap_dig_base_units: 0,
+        base_price_dig_base_units: REQUIREMENT,
+        required_per_store_dig_base_units: REQUIREMENT,
     }
 }
 

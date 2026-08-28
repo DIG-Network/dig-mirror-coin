@@ -142,7 +142,6 @@ impl MirrorCensus {
     pub fn excluded(&self) -> Exclusions {
         self.excluded
     }
-
 }
 
 /// The outcome of asking for a census: a final one, or a refusal to answer.
@@ -319,11 +318,10 @@ pub fn census<S: ChainSource>(
     let mut excluded = Exclusions::default();
     let mut selected: BTreeMap<Triple, Selection> = BTreeMap::new();
     let qualifying_epoch = BigInt::from(prior.epoch);
-    // The only `EpochRecord` field this crate reads whose NAME is changing: `dig-mirror-collateral`
-    // is renaming its `*_mojos` fields for 0.2.0 — a mojo is XCH's base unit and a DIG CAT base unit
-    // is nine orders of magnitude larger — so keeping this read to one line keeps the adoption a
-    // one-line edit rather than a sweep. (`prior.epoch` is read above as well; its name is not.)
-    let required_per_store = prior.required_per_store_mojos;
+    // DIG CAT base units, not mojos. `dig-mirror-collateral` 0.2.0 renamed these fields to say so:
+    // a mojo is XCH's base unit at 10^-12 XCH and a DIG CAT base unit is 10^-3 DIG, nine orders of
+    // magnitude apart, on a money path. No value changed in the rename.
+    let required_per_store = prior.required_per_store_dig_base_units;
 
     // Pass one, over the ENTIRE population: the rules whose inputs are already on the coin record.
     // No chain read, no CLVM. This is what makes exhaustive enumeration affordable — dust is
