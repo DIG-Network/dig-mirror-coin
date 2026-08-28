@@ -306,7 +306,12 @@ crate**. An implementation MUST take the epoch start as an input.
 
 A coin at `H(n)` qualifies for the census of epoch `n` when all of the following hold.
 
-- **C1** — it sits at the mirror puzzle hash (§3.1) and its collateral is $DIG.
+- **C0** — the record is at the mirror puzzle hash (§3.1). A source MAY return records it was not
+  asked for, and an implementation MUST NOT read any other rule off such a record.
+- **C1** — its collateral is **$DIG**, established from the lineage proof in its creating spend.
+  C0 does not imply C1 and MUST NOT be treated as implying it: the mirror puzzle hash is a CAT outer
+  hash, but it is still 32 bytes, and an ordinary XCH `CREATE_COIN` paying to it produces a record
+  there whose amount is denominated in mojos.
 - **C2** — it was created at a height less than or equal to `H(n)`.
 - **C3** — it was not spent at any height less than or equal to `H(n)`. A coin spent *after* `H(n)`
   was locked at the height being counted and MUST still qualify. It follows that the population read
@@ -314,7 +319,12 @@ A coin at `H(n)` qualifies for the census of epoch `n` when all of the following
 - **C4** — its declared epoch equals `n-1` **exactly**. A coin declaring an earlier epoch MUST be
   excluded, and so MUST a coin declaring a later one: pre-posting for a future epoch and padding with
   a stale coin are both excluded by the same rule.
-- **C5** — its amount is greater than or equal to the requirement of epoch `n-1`.
+- **C5** — its collateral is greater than or equal to the requirement of epoch `n-1`. The
+  requirement is denominated in DIG CAT base units, so this comparison is meaningful only once C1
+  has established the asset, and an implementation MUST NOT decide C5 before C1. An implementation
+  MAY compare the record's raw amount earlier as a filter — a qualifying coin's collateral equals
+  its record amount, so such a filter cannot discard a coin that would have qualified — but MUST NOT
+  treat passing it as evidence of collateral, and MUST NOT rest a bound on it.
 - **C6** — its memos parse as a well-formed advertisement (§5).
 - **C7** — the counted unit is the triple `(owner, store, root)`. An implementation MUST NOT count
   coins.
@@ -381,6 +391,13 @@ otherwise a pruned source silently reports a smaller network, which is the direc
 requirement for everyone, with no attacker involved. This is where a census MUST diverge from `list`
 (§6.2), whose tolerance is correct for a different question.
 
+A spend **of a different coin** is such an unanswerable read, and is the case an implementation is
+most likely to miss. An implementation MUST verify that the returned spend's coin id equals the
+candidate's `parent_coin_info` before interpreting it. Without that check, the spend classifies
+cleanly, no output carries the candidate's coin id, and the candidate is recorded as "not a mirror
+coin" — a fact about the source reported as a fact about the chain. A source could then delete any
+chosen mirror from a census while the census still completed.
+
 ### 8.8 The census bound is a REFUSAL, and here that is the opposite of §6.5
 
 A census MUST examine the ENTIRE candidate population. It MUST NOT compute a census over a prefix of
@@ -394,13 +411,24 @@ included per C3. A prefix of that set is a censorship primitive: enough dust era
 from every node permanently, and two nodes whose sources enumerate differently take different
 prefixes and compute different requirements from the same chain.
 
-An implementation MAY bound the work it does per candidate. Where a bound is exceeded it MUST report
-that it could not compute the census, and MUST NOT return a census — a node that says it cannot
-compute the network is recoverable, and a node that quietly computes a smaller one is not.
+An implementation MAY bound the work it does. Where a bound is exceeded it MUST report that it could
+not compute the census, and MUST NOT return a census — a node that says it cannot compute the network
+is recoverable, and a node that quietly computes a smaller one is not.
 
-Rules decidable from the coin record alone — C2, C3 and C5 — SHOULD be applied to the whole
-population before any rule requiring a further chain read, so that the population an implementation
-must bound is the collateralised one rather than the free one.
+A refusal over an attacker-writable set is itself a denial, so **what** is bounded decides whether the
+bound is safe. A bound MUST NOT be denominated in a quantity an attacker obtains for free. In
+particular it MUST NOT be denominated in candidate coins: coins at the mirror puzzle hash cost the
+price of a `CREATE_COIN`, thousands may be minted by one transaction, and a census that refuses on
+their count can be denied permanently — the requirement that would price the flood out can only rise
+via a census.
+
+A bound SHOULD instead be denominated in **distinct creating spends**, which is both the work the
+expensive pass performs — one execution answers for every output that spend produced — and a quantity
+an attacker must get on chain per unit of work forced. An implementation that bounds this way MUST
+execute each creating spend at most once per census, or the bound does not bound the work.
+
+Rules decidable from the coin record alone — C0, C2 and C3 — SHOULD be applied to the whole
+population before any rule requiring a further chain read.
 
 ## 9. Conformance
 
@@ -438,10 +466,15 @@ An implementation conforms when:
     (§8.6), and errors rather than shrinking when a read cannot be answered (§8.7);
 18. its census returns the SAME result for a population whichever order a source enumerates it in,
     including when an honest coin sits past the point a bound would have stopped at (§8.8);
-19. its census refuses to answer, rather than answering over a prefix, when its per-candidate bound
-    is exceeded — and does not refuse a population exactly at that bound (§8.8);
-20. a flood of coins below the epoch requirement does not consume its census bound (§8.8);
+19. its census refuses to answer, rather than answering over a prefix, when its bound is exceeded —
+    and does not refuse a population exactly at that bound (§8.8);
+20. a flood of coins minted by ONE creating spend does not consume its census bound, however large,
+    and an honest network beside such a flood is still counted (§8.8);
 21. its census fails closed when a candidate's creating spend cannot be produced, while `list`
     continues to report the same coin as unresolved (§8.7, §6.2);
 22. a puzzle reveal substituted onto a real coin cannot re-attribute that coin's owner, store or
-    root, and the same coin with its genuine spend is still attributed (§5, §7).
+    root, and the same coin with its genuine spend is still attributed (§5, §7);
+23. its census excludes a record the source returned that is not at the mirror puzzle hash, without
+    fetching a creating spend for it, and still counts an honest coin beside it (§8.2 C0);
+24. its census ends, rather than excluding the coin and completing, when a source answers a
+    candidate's creating-spend read with a different coin's genuine spend (§8.7).
