@@ -1096,3 +1096,51 @@ fn the_same_coin_with_its_genuine_spend_is_attributed_and_the_census_completes()
     assert_eq!(census.census().stores, 2);
     assert_eq!(census.census().owners, 2);
 }
+
+/// A source that answers one coin's creating-spend read with a DIFFERENT coin's genuine spend must
+/// end the census, not quietly drop the coin it lied about.
+///
+/// # The property, and the nearest wrong implementation
+///
+/// The property is that a mismatched spend is a **source gap**, not a chain fact. The nearest wrong
+/// implementation is the one shipped before this test: the substituted spend is self-consistent, so
+/// its reveal binds and its own children parse — the census simply finds no child with the victim's
+/// coin id, reads that as "not a mirror coin", counts it in `unreadable`, and **completes**. Every
+/// outcome-only assertion an exclusion test could make is satisfied by that.
+///
+/// So the fixture varies exactly one actor and keeps an honest control beside it: two genuine,
+/// fully-qualifying mirror coins, of which only the victim's spend read is redirected. A census that
+/// still completes reports a one-store network — a targeted, invisible deletion of any chosen
+/// mirror, which is the direction SPEC section 8.7 names as harmful because it lowers the
+/// requirement for everyone. Asserting the ERROR rather than the count is what distinguishes failing
+/// closed from excluding, and it is why the control above it asserts `unreadable == 0`.
+#[test]
+fn a_spend_of_a_different_coin_ends_the_census_rather_than_deleting_the_coin_it_answered_for() {
+    let victim = wallet(1);
+    let bystander = wallet(2);
+
+    let mut chain = CensusChain::new();
+    let victim_coin = publish_qualifying(&mut chain, &victim, store_a(), root_1(), AT_REQUIREMENT);
+    let bystander_coin =
+        publish_qualifying(&mut chain, &bystander, store_b(), root_2(), AT_REQUIREMENT);
+
+    // The control: answered honestly, both coins count and nothing is written off as unreadable.
+    let control = run(&chain);
+    assert_eq!(control.census().stores, 2, "control: both stores counted");
+    assert_eq!(control.census().owners, 2, "control: both owners counted");
+    assert_eq!(control.excluded().unreadable, 0);
+
+    // One actor varied: the victim's parent now answers with the bystander's real, self-consistent,
+    // on-chain spend. Nothing about the bystander's own coin changes.
+    let bystander_spend = chain.creating_spends[&bystander_coin.parent_coin_info].clone();
+    chain
+        .creating_spends
+        .insert(victim_coin.parent_coin_info, bystander_spend);
+
+    let outcome = census(&chain, &prior_record(), at(CENSUS_AT));
+
+    assert!(
+        matches!(outcome, Err(MirrorError::Unauthenticated { .. })),
+        "a spend of a different coin is a source gap and must end the census, got {outcome:?}"
+    );
+}

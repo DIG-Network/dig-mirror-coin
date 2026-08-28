@@ -407,6 +407,20 @@ pub(crate) fn authenticate<S: ChainSource>(
         .map_err(unavailable)?
         .ok_or(MirrorError::Unauthenticated { coin_id })?;
 
+    // The spend the source handed back must be the spend of the coin that was ASKED for. Nothing
+    // below re-derives that: on a mismatch `classify` finds no child with this coin id and answers
+    // `NotAMirror`, which every caller reads as a fact about the chain — "this coin is not a mirror"
+    // — when it is a fact about the source. A hostile source could then delete any chosen mirror
+    // from a census by answering one wrong spend, invisibly and while the census still completed.
+    //
+    // A successful classification does force this binding, because a child's coin id is a hash of
+    // its parent's id. But it forces it only when it succeeds, and the failure path is the one an
+    // adversary picks. SPEC section 8.7: a creating spend the source did not produce is an
+    // unanswerable read, not an answer of "no".
+    if creating_spend.coin.coin_id() != candidate.coin.parent_coin_info {
+        return Err(MirrorError::Unauthenticated { coin_id });
+    }
+
     MirrorCoin::classify(&creating_spend, coin_id)
 }
 
