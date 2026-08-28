@@ -91,6 +91,12 @@ struct CensusChain {
     timestamps: HashMap<u32, u64>,
     peak: Option<u32>,
     spend_read_fails_for: Option<Bytes32>,
+    /// Records this source returns for ANY puzzle-hash query, whatever it was asked for.
+    ///
+    /// The double filters honestly by default, which means it cannot express a source that answers
+    /// with records it was not asked about — and a double that cannot express the lie cannot
+    /// witness the rule that catches it.
+    volunteered: Vec<CoinRecord>,
 }
 
 impl CensusChain {
@@ -112,6 +118,17 @@ impl CensusChain {
             coinbase: false,
         });
         self.creating_spends.insert(spend.coin.coin_id(), spend);
+    }
+
+    /// A record the source volunteers for every puzzle-hash query regardless of what was asked.
+    fn volunteer(&mut self, coin: Coin) {
+        self.volunteered.push(CoinRecord {
+            coin,
+            confirmed_height: Some(1),
+            spent_height: None,
+            timestamp: None,
+            coinbase: false,
+        });
     }
 
     /// A coin whose creating spend is absent — a stranger's dust sitting at the shared puzzle hash.
@@ -150,6 +167,7 @@ impl ChainSource for CensusChain {
             .iter()
             .filter(|record| record.coin.puzzle_hash == puzzle_hash)
             .filter(|record| include_spent || !record.is_spent())
+            .chain(self.volunteered.iter())
             .cloned()
             .collect())
     }
@@ -1106,6 +1124,38 @@ fn an_xch_flood_priced_in_the_wrong_unit_does_not_make_an_honest_network_uncount
         ),
         CensusOutcome::Pending { .. } => panic!("the peak is far past the census height"),
     }
+}
+
+/// **C0.** A record the source returns that is NOT at the mirror puzzle hash is excluded, and the
+/// honest coin beside it still counts.
+///
+/// The candidate list arrives from the source, and nothing before this checked that its records are
+/// at the hash that was asked for. Every rule after it reads as a fact about a mirror coin, so a
+/// record at some other puzzle hash is a record about which nothing has been established at all —
+/// including the amount, which would otherwise be compared against the epoch requirement.
+///
+/// The fixture varies one actor: the foreign record is otherwise perfect. It sits at the
+/// requirement, is confirmed before the census height and is unspent, so every other cheap rule
+/// admits it. Only C0 can reject it, and the honest control pins that C0 did not over-reach.
+#[test]
+fn a_record_at_a_foreign_puzzle_hash_is_excluded_and_the_honest_coin_still_counts() {
+    let mut chain = CensusChain::new();
+    publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+    chain.volunteer(Coin::new(
+        Bytes32::new([0x5E; 32]),
+        Bytes32::new([0xEE; 32]),
+        AT_REQUIREMENT,
+    ));
+
+    let census = run(&chain);
+
+    assert_eq!(census.census().stores, 1, "the honest coin still counts");
+    assert_eq!(census.excluded().foreign_puzzle, 1);
+    assert_eq!(
+        census.excluded().unreadable,
+        0,
+        "C0 rejects it before any creating spend is fetched, so it is not an unreadable coin"
+    );
 }
 
 /// The cost floor of the bound, stated from the side that is expensive rather than the side that is
