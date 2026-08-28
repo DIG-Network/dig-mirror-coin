@@ -33,12 +33,15 @@
 //! absence of one. Neither ever degrades an unreachable source into "nothing found", and neither
 //! ever promotes one unreadable coin into an unreachable source.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+
 use chia_protocol::{Bytes32, CoinSpend};
 use dig_chainsource_interface::{ChainSource, CoinRecord};
 use num_bigint::BigInt;
 
 use crate::asset::mirror_coin_puzzle_hash;
-use crate::coin::{Candidate, MirrorCoin};
+use crate::coin::{Candidate, MirrorCoin, ParentOutputs};
 use crate::error::MirrorError;
 use crate::namespace::mirror_hint;
 
@@ -401,27 +404,81 @@ pub(crate) fn authenticate<S: ChainSource>(
     source: &S,
     candidate: &CoinRecord,
 ) -> Result<Candidate, MirrorError> {
-    let coin_id = candidate.coin.coin_id();
-    let creating_spend: CoinSpend = source
-        .coin_spend(candidate.coin.parent_coin_info)
-        .map_err(unavailable)?
-        .ok_or(MirrorError::Unauthenticated { coin_id })?;
+    SpendCache::new().authenticate(source, candidate)
+}
 
-    // The spend the source handed back must be the spend of the coin that was ASKED for. Nothing
-    // below re-derives that: on a mismatch `classify` finds no child with this coin id and answers
-    // `NotAMirror`, which every caller reads as a fact about the chain — "this coin is not a mirror"
-    // — when it is a fact about the source. A hostile source could then delete any chosen mirror
-    // from a census by answering one wrong spend, invisibly and while the census still completed.
-    //
-    // A successful classification does force this binding, because a child's coin id is a hash of
-    // its parent's id. But it forces it only when it succeeds, and the failure path is the one an
-    // adversary picks. SPEC section 8.7: a creating spend the source did not produce is an
-    // unanswerable read, not an answer of "no".
-    if creating_spend.coin.coin_id() != candidate.coin.parent_coin_info {
-        return Err(MirrorError::Unauthenticated { coin_id });
+/// The creating spends executed so far, keyed by the parent coin whose spend they are.
+///
+/// # Why a cache is a correctness concern and not a speed one
+///
+/// Executing a creating spend is the expensive half of authentication, and its cost is per SPEND,
+/// not per coin: one execution answers for every collateral output that spend produced. A caller
+/// that bounds its work — [`census`](crate::census) refuses rather than truncating when the
+/// population is too large — can only choose a sound bound if the quantity it counts is the
+/// quantity it pays for. Reading each spend once is what makes "distinct creating spends" that
+/// quantity.
+///
+/// Failures are deliberately NOT cached. Every one of them is either an unanswerable read or a
+/// malformed spend, and both end the census that would have re-asked.
+pub(crate) struct SpendCache {
+    by_parent: HashMap<Bytes32, ParentOutputs>,
+}
+
+impl SpendCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            by_parent: HashMap::new(),
+        }
     }
 
-    MirrorCoin::classify(&creating_spend, coin_id)
+    /// Re-derives a candidate coin, executing its creating spend only if it has not been seen.
+    pub(crate) fn authenticate<S: ChainSource>(
+        &mut self,
+        source: &S,
+        candidate: &CoinRecord,
+    ) -> Result<Candidate, MirrorError> {
+        let coin_id = candidate.coin.coin_id();
+        let parent = candidate.coin.parent_coin_info;
+
+        let outputs = match self.by_parent.entry(parent) {
+            Entry::Occupied(seen) => seen.into_mut(),
+            Entry::Vacant(slot) => slot.insert(Self::read(source, parent, coin_id)?),
+        };
+
+        outputs.candidate(coin_id)
+    }
+
+    /// Reads and executes one creating spend. `on_behalf_of` names the coin the error should blame.
+    fn read<S: ChainSource>(
+        source: &S,
+        parent: Bytes32,
+        on_behalf_of: Bytes32,
+    ) -> Result<ParentOutputs, MirrorError> {
+        let creating_spend: CoinSpend = source.coin_spend(parent).map_err(unavailable)?.ok_or(
+            MirrorError::Unauthenticated {
+                coin_id: on_behalf_of,
+            },
+        )?;
+
+        // The spend the source handed back must be the spend of the coin that was ASKED for.
+        // Nothing below re-derives that: on a mismatch the readout simply holds no child with the
+        // candidate's coin id and answers `NotAMirror`, which every caller reads as a fact about the
+        // chain — "this coin is not a mirror" — when it is a fact about the source. A hostile source
+        // could then delete any chosen mirror from a census by answering one wrong spend, invisibly
+        // and while the census still completed.
+        //
+        // A successful classification does force this binding, because a child's coin id is a hash
+        // of its parent's id. But it forces it only when it succeeds, and the failure path is the
+        // one an adversary picks. SPEC section 8.7: a creating spend the source did not produce is
+        // an unanswerable read, not an answer of "no".
+        if creating_spend.coin.coin_id() != parent {
+            return Err(MirrorError::Unauthenticated {
+                coin_id: on_behalf_of,
+            });
+        }
+
+        MirrorCoin::read_parent_outputs(&creating_spend)
+    }
 }
 
 /// Reduces a per-candidate failure to the reason a caller can act on.

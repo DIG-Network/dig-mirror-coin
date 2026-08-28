@@ -27,7 +27,7 @@ use dig_mirror_collateral::{EpochCensus, EpochRecord, CENSUS_FINALITY_DEPTH_BLOC
 use num_bigint::BigInt;
 use support::{
     creating_spend_of_amount, declared_memos, epoch, hint_of, mirror_memos, root_1, root_2,
-    store_a, store_b, wallet, Wallet,
+    store_a, store_b, wallet, xch_spend_paying_the_mirror_hash, Wallet,
 };
 
 /// The height every census in this file is taken at.
@@ -207,11 +207,11 @@ fn take_final(outcome: CensusOutcome) -> MirrorCensus {
         ),
         CensusOutcome::Incomplete {
             candidates,
-            authenticable,
+            creating_spends,
             limit,
             ..
         } => panic!(
-            "expected a final census; got Incomplete: {authenticable} of {candidates} over {limit}"
+            "expected a final census; got Incomplete: {creating_spends} spends, {candidates} candidates, limit {limit}"
         ),
     }
 }
@@ -895,10 +895,16 @@ fn a_bigint_epoch_is_compared_against_the_records_epoch_and_not_its_length() {
 /// Publishes `count` distinct coins at the shared mirror puzzle hash, each of `amount`, with no
 /// creating spend.
 ///
-/// No creating spend is needed because nothing in these tests is meant to reach `authenticate`:
-/// coins below the requirement are screened out before it, and a population over the bound is
-/// refused before it. A fixture that had to mint ten thousand genuine CAT spends would be testing
-/// the fixture builder.
+/// Each coin has a DISTINCT fabricated parent, so this flood costs one creating spend per coin and
+/// is the population the bound is denominated in. It is the EXPENSIVE form of a flood: an attacker
+/// mounting it must get that many spends on chain.
+///
+/// It is not the cheap form, and it must not be mistaken for it. For a flood minted by a single
+/// transaction — which is what an attacker actually buys — see
+/// [`mirror_priced_xch_flood`]. An earlier revision of this file used this helper for both, and the
+/// bound test built on it therefore certified the hole it was meant to close: the coins have no
+/// creating spend at all, so what it proved was that a coin needs an INTEGER to consume the bound,
+/// not collateral.
 fn flood(chain: &mut CensusChain, count: usize, amount: u64) {
     for index in 0..count {
         let mut parent = [0u8; 32];
@@ -912,6 +918,25 @@ fn flood(chain: &mut CensusChain, count: usize, amount: u64) {
     }
 }
 
+/// `count` coins at the mirror puzzle hash, minted by ONE ordinary XCH spend.
+///
+/// This is the cheap flood, and the one that matters. `mirror_coin_puzzle_hash()` is a CAT outer
+/// hash but still only 32 bytes, so a plain XCH `CREATE_COIN` puts a record there whose `amount` is
+/// in **mojos** — nine orders of magnitude cheaper per unit than the DIG CAT base units the epoch
+/// requirement is denominated in. Every coin here is therefore "at the requirement" as a bare `u64`
+/// and worth essentially nothing.
+///
+/// One spend, `count` records: the whole flood is a single transaction.
+fn mirror_priced_xch_flood(chain: &mut CensusChain, count: usize, amount: u64) {
+    let amounts = vec![amount; count];
+    let funder = wallet(9);
+    let (spend, coins) = xch_spend_paying_the_mirror_hash(&funder, amount * count as u64, &amounts);
+
+    for coin in coins {
+        chain.publish(spend.clone(), coin, CENSUS_AT - 10, None);
+    }
+}
+
 /// The attack the bound exists to stop, and the reason it must not be a prefix.
 ///
 /// Dust is free to publish and the population never shrinks, so if the bound kept the first
@@ -921,7 +946,7 @@ fn flood(chain: &mut CensusChain, count: usize, amount: u64) {
 #[test]
 fn a_dust_flood_larger_than_the_bound_does_not_hide_an_honest_coin_published_after_it() {
     let mut chain = CensusChain::new();
-    flood(&mut chain, MAX_CANDIDATES + 1, BELOW_REQUIREMENT);
+    mirror_priced_xch_flood(&mut chain, MAX_CANDIDATES + 1, AT_REQUIREMENT);
     publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
 
     let census = run(&chain);
@@ -948,12 +973,12 @@ fn a_dust_flood_larger_than_the_bound_does_not_hide_an_honest_coin_published_aft
 #[test]
 fn the_census_is_the_same_whichever_end_of_a_dust_flood_the_honest_coin_sits_at() {
     let mut last = CensusChain::new();
-    flood(&mut last, MAX_CANDIDATES + 1, BELOW_REQUIREMENT);
+    mirror_priced_xch_flood(&mut last, MAX_CANDIDATES + 1, AT_REQUIREMENT);
     publish_qualifying(&mut last, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
 
     let mut first = CensusChain::new();
     publish_qualifying(&mut first, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
-    flood(&mut first, MAX_CANDIDATES + 1, BELOW_REQUIREMENT);
+    mirror_priced_xch_flood(&mut first, MAX_CANDIDATES + 1, AT_REQUIREMENT);
 
     assert_eq!(
         run(&last).census(),
@@ -964,8 +989,10 @@ fn the_census_is_the_same_whichever_end_of_a_dust_flood_the_honest_coin_sits_at(
 
 /// Over the bound, the census refuses rather than answering, and says what it saw.
 ///
-/// The flood is AT the requirement so it survives the cheap screen and genuinely reaches the
-/// expensive pass's bound - dust would be rejected earlier and could never exercise this path.
+/// The bound counts DISTINCT CREATING SPENDS, so `flood` — one fabricated parent per coin — is the
+/// population that exercises it. `mirror_priced_xch_flood` deliberately does not: a thousand coins
+/// from one transaction are one unit of work and must not consume a thousand of the bound. The test
+/// below it pins that.
 #[test]
 fn a_population_over_the_bound_is_refused_rather_than_truncated() {
     let mut chain = CensusChain::new();
@@ -978,12 +1005,12 @@ fn a_population_over_the_bound_is_refused_rather_than_truncated() {
         CensusOutcome::Incomplete {
             census_height,
             candidates,
-            authenticable,
+            creating_spends,
             limit,
         } => {
             assert_eq!(census_height, CENSUS_AT);
             assert_eq!(candidates, MAX_CANDIDATES + 1);
-            assert_eq!(authenticable, MAX_CANDIDATES + 1);
+            assert_eq!(creating_spends, MAX_CANDIDATES + 1);
             assert_eq!(limit, MAX_CANDIDATES);
         }
         CensusOutcome::Final(census) => panic!(
@@ -1016,22 +1043,87 @@ fn a_population_exactly_at_the_bound_is_not_refused() {
     }
 }
 
-/// Dust does not consume the bound, because the bound governs the expensive pass alone.
+/// **G3.** A flood of XCH coins at the mirror puzzle hash, priced at the epoch requirement in the
+/// wrong unit, must not make an honest network uncountable.
 ///
-/// This is what makes exhaustive enumeration affordable and is the load-bearing half of running the
-/// cheap rules first: a flood far larger than `MAX_CANDIDATES` still leaves an honest census.
+/// # The property, and why the fixture is shaped this way
+///
+/// The property is that the cheap pass never trusts a number whose unit it has not established.
+/// `mirror_coin_puzzle_hash()` is a CAT outer hash and still only 32 bytes, so an ordinary XCH
+/// `CREATE_COIN` lands a record there whose amount is in mojos. Under the screen this replaces,
+/// every one of these coins was "at the requirement" for a nine-orders-of-magnitude discount, and
+/// `MAX_CANDIDATES + 1` of them turned every node's census into `Incomplete` — permanently, because
+/// the requirement that would price them out can only rise via a census.
+///
+/// Three things about the fixture are load-bearing:
+///
+/// - The flood is minted by **one spend**, which is what an attacker actually buys. That is also
+///   what makes it distinguishable from the bound test above: a helper that gives each coin its own
+///   parent measures the expensive attack and cannot see this one.
+/// - The honest network is **three stores across two owners**, not zero. Asserting only that the
+///   flood contributes nothing is satisfied by a census that returned nothing at all, which is
+///   precisely the failure under test.
+/// - The flood sits **at** `AT_REQUIREMENT`, the value the old screen admitted. One unit lower
+///   would have been rejected by the code this test exists to prove obsolete.
 #[test]
-fn dust_does_not_consume_the_bound_it_is_screened_before_it() {
+fn an_xch_flood_priced_in_the_wrong_unit_does_not_make_an_honest_network_uncountable() {
     let mut chain = CensusChain::new();
-    flood(&mut chain, MAX_CANDIDATES * 2, BELOW_REQUIREMENT);
+    // Three DISTINCT owners: `creating_spend_of_amount` derives the parent coin from the owner and
+    // the amount alone, so two coins from one wallet at one amount are the same coin id and the
+    // fixture would quietly be a two-store network wearing a three-store label.
     publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
+    publish_qualifying(&mut chain, &wallet(2), store_b(), root_1(), AT_REQUIREMENT);
+    publish_qualifying(&mut chain, &wallet(3), store_a(), root_2(), AT_REQUIREMENT);
 
-    let census = run(&chain);
+    let honest = run(&chain).census();
+    assert_eq!(honest.stores, 3, "control: three stores before the flood");
+    assert_eq!(honest.owners, 3, "control: three owners before the flood");
 
-    assert_eq!(census.census().stores, 1);
-    assert_eq!(
-        census.excluded().under_collateralised as usize,
-        MAX_CANDIDATES * 2
+    mirror_priced_xch_flood(&mut chain, MAX_CANDIDATES + 1, AT_REQUIREMENT);
+
+    let outcome = census(&chain, &prior_record(), at(CENSUS_AT))
+        .expect("every read in this fixture is answerable");
+
+    match outcome {
+        CensusOutcome::Final(census) => {
+            assert_eq!(
+                census.census(),
+                honest,
+                "the flood must move none of the three controller inputs"
+            );
+            assert_eq!(
+                census.excluded().unreadable as usize,
+                MAX_CANDIDATES + 1,
+                "every flood coin is excluded by C1, once its asset is established"
+            );
+        }
+        CensusOutcome::Incomplete {
+            creating_spends,
+            limit,
+            ..
+        } => panic!(
+            "a single-transaction flood made the network uncountable: {creating_spends} spends, limit {limit}"
+        ),
+        CensusOutcome::Pending { .. } => panic!("the peak is far past the census height"),
+    }
+}
+
+/// The cost floor of the bound, stated from the side that is expensive rather than the side that is
+/// free: a flood of the same size costs the bound only when each coin has its OWN creating spend.
+///
+/// Without this, the test above would be equally satisfied by a census that had simply stopped
+/// bounding anything.
+#[test]
+fn the_same_flood_size_does_consume_the_bound_when_every_coin_has_its_own_spend() {
+    let mut chain = CensusChain::new();
+    flood(&mut chain, MAX_CANDIDATES + 1, AT_REQUIREMENT);
+
+    assert!(
+        matches!(
+            census(&chain, &prior_record(), at(CENSUS_AT)),
+            Ok(CensusOutcome::Incomplete { .. })
+        ),
+        "one creating spend per coin is the expensive flood, and the bound still refuses it"
     );
 }
 

@@ -194,3 +194,44 @@ pub fn declared_memos(
     entries.extend(urls.iter().map(|url| Bytes::new(url.as_bytes().to_vec())));
     entries
 }
+
+/// An ordinary **XCH** spend that pays coins to the mirror puzzle hash.
+///
+/// This is the fixture that distinguishes a puzzle hash from an asset, and no other helper here can
+/// build it. `mirror_coin_puzzle_hash()` is a CAT outer hash, but it is still only 32 bytes: any
+/// spend at all may name it in a `CREATE_COIN`, and the resulting records sit in the census's
+/// candidate list carrying an `amount` denominated in **mojos**. A screen that compares that number
+/// against a threshold in DIG CAT base units is comparing a number to a unit it does not have.
+///
+/// The coins are minted by ONE spend, which is the shape a real attacker uses and the shape that
+/// makes the attack cheap: one transaction, `amounts.len()` records.
+pub fn xch_spend_paying_the_mirror_hash(
+    owner: &Wallet,
+    parent_amount: u64,
+    amounts: &[u64],
+) -> (CoinSpend, Vec<Coin>) {
+    let mut ctx = SpendContext::new();
+    let parent = Coin::new(Bytes32::new([0x77; 32]), owner.puzzle_hash, parent_amount);
+
+    let mirror_hash: Bytes32 = P2ParentCoin::puzzle_hash(Some(DIG_ASSET_ID)).into();
+    let mut conditions = Conditions::new();
+    for amount in amounts {
+        conditions = conditions.create_coin(mirror_hash, *amount, Memos::None);
+    }
+
+    StandardLayer::new(owner.public_key)
+        .spend(&mut ctx, parent, conditions)
+        .unwrap();
+
+    let spend = ctx
+        .take()
+        .into_iter()
+        .find(|spend| spend.coin == parent)
+        .expect("the parent XCH spend");
+    let coins = amounts
+        .iter()
+        .map(|amount| Coin::new(parent.coin_id(), mirror_hash, *amount))
+        .collect();
+
+    (spend, coins)
+}

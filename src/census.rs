@@ -47,7 +47,7 @@
 //! A coin that is read successfully and fails a rule is the opposite case: that is an answer, it is
 //! counted in [`Exclusions`], and the census proceeds.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chia_protocol::Bytes32;
 use dig_chainsource_interface::{ChainSource, CoinRecord};
@@ -57,7 +57,7 @@ use num_bigint::BigInt;
 use crate::asset::mirror_coin_puzzle_hash;
 use crate::coin::Candidate;
 use crate::error::MirrorError;
-use crate::query::{authenticate, unavailable, MAX_CANDIDATES};
+use crate::query::{unavailable, SpendCache, MAX_CANDIDATES};
 
 /// How far a timestamp probe will walk back through non-transaction blocks before giving up.
 ///
@@ -86,6 +86,10 @@ pub struct CensusHeight {
 /// situations call for very different responses from an operator.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Exclusions {
+    /// **C0** — the source returned a record that is not at the mirror puzzle hash it was asked
+    /// for. A fact about the source, not about the chain; nothing else here would have been safe to
+    /// read off such a record.
+    pub foreign_puzzle: u64,
     /// **C2** — created after the census height, so not yet part of the network being counted.
     pub not_yet_created: u64,
     /// **C3** — already spent at or before the census height.
@@ -95,8 +99,11 @@ pub struct Exclusions {
     pub undated: u64,
     /// **C4** — declares an epoch other than the one being qualified against.
     pub wrong_epoch: u64,
-    /// **C5** — locks less than that epoch's requirement. See the module docs: these are invisible,
-    /// never evidence.
+    /// **C5** — locks less than that epoch's requirement, measured against the AUTHENTICATED coin.
+    /// See the module docs: these are invisible, never evidence.
+    ///
+    /// Only ever counted behind C1, because an amount whose asset is unknown is a number without a
+    /// unit and cannot be compared against a threshold denominated in DIG CAT base units.
     pub under_collateralised: u64,
     /// **C1/C6** — not a mirror coin at all, or its memos could not be read: a sibling collateral
     /// coin, a stranger's dust, collateral in some other asset, or an absent creating spend.
@@ -174,15 +181,22 @@ pub enum CensusOutcome {
     /// nodes keeping *different* prefixes of the same chain would fork. So the node says it cannot
     /// compute the network rather than computing a smaller one.
     ///
-    /// Reaching this requires `limit` coins that each already meet the epoch requirement in full —
-    /// the cheap rules are applied to the entire population first, so dust cannot get here.
+    /// Reaching this requires `limit` DISTINCT CREATING SPENDS among the surviving candidates, not
+    /// `limit` coins. That is deliberate: the expensive pass executes each spend once and answers
+    /// for every output it produced, so a thousand coins minted by one transaction cost one
+    /// execution and must not be able to consume a thousand of the bound.
+    ///
+    /// The bound counted coins until it was shown that a coin costs nothing. The mirror puzzle hash
+    /// is a CAT outer hash but still only 32 bytes, so an ordinary XCH `CREATE_COIN` puts a record
+    /// there for mojos; a flood of those denied every node's census permanently, and permanently is
+    /// not an exaggeration — the requirement that would price them out can only rise via a census.
     Incomplete {
         /// The height the census would have been taken at.
         census_height: u32,
         /// How many coins pay to the shared mirror puzzle hash in total.
         candidates: usize,
-        /// How many of those survived the cheap rules and would have needed authenticating.
-        authenticable: usize,
+        /// How many distinct creating spends the surviving candidates would have needed executed.
+        creating_spends: usize,
         /// The bound that was exceeded, [`MAX_CANDIDATES`].
         limit: usize,
     },
@@ -323,31 +337,56 @@ pub fn census<S: ChainSource>(
     // magnitude apart, on a money path. No value changed in the rename.
     let required_per_store = prior.required_per_store_dig_base_units;
 
-    // Pass one, over the ENTIRE population: the rules whose inputs are already on the coin record.
-    // No chain read, no CLVM. This is what makes exhaustive enumeration affordable — dust is
-    // rejected on a `u64` comparison, so a flood buys an attacker no work beyond the read the source
-    // already performed to answer at all.
+    // Pass one, over the ENTIRE population: the rules whose inputs are already on the coin record
+    // AND whose operands have an established meaning. No chain read, no CLVM. See `prescreen` for
+    // the operand table, and for why the collateral rule is NOT among them.
+    let mirror_puzzle_hash = mirror_coin_puzzle_hash();
     let authenticable: Vec<CoinRecord> = candidates
         .into_iter()
-        .filter(|candidate| prescreen(candidate, at.height, required_per_store, &mut excluded))
+        .filter(|candidate| {
+            prescreen(
+                candidate,
+                at.height,
+                mirror_puzzle_hash,
+                required_per_store,
+                &mut excluded,
+            )
+        })
         .collect();
 
-    // Only the expensive pass is bounded, and it is bounded by a REFUSAL rather than a prefix. See
-    // `CensusOutcome::Incomplete`: keeping a prefix of an attacker-writable set is a censorship
-    // primitive, and a prefix two nodes may choose differently is a fork.
-    if authenticable.len() > MAX_CANDIDATES {
+    // The bound is on DISTINCT CREATING SPENDS, not on candidates, because that is the quantity the
+    // expensive pass actually consumes: `read_parent_outputs` executes each spend once and answers
+    // for every output it produced, so a thousand coins from one transaction cost one execution.
+    //
+    // Bounding candidates instead made the refusal reachable for the price of a thousand
+    // `CREATE_COIN`s in a single spend — and, before C5 moved behind C1, for the price of dust in
+    // the wrong asset. A denied census is self-sustaining, because the requirement that would price
+    // the flood out can only rise via a census. Counting spends prices the refusal in transactions
+    // an attacker must actually get on chain.
+    //
+    // It is still a REFUSAL rather than a prefix. See `CensusOutcome::Incomplete`: keeping a prefix
+    // of an attacker-writable set is a censorship primitive, and a prefix two nodes may choose
+    // differently is a fork.
+    let creating_spends: BTreeSet<Bytes32> = authenticable
+        .iter()
+        .map(|candidate| candidate.coin.parent_coin_info)
+        .collect();
+    if creating_spends.len() > MAX_CANDIDATES {
         return Ok(CensusOutcome::Incomplete {
             census_height: at.height,
             candidates: examined,
-            authenticable: authenticable.len(),
+            creating_spends: creating_spends.len(),
             limit: MAX_CANDIDATES,
         });
     }
 
-    // Pass two: the rules that need the creating spend.
+    // Pass two: the rules that need the creating spend. `spends` holds each executed spend's outputs
+    // so that the bound above genuinely bounds the work below.
+    let mut spends = SpendCache::new();
     for candidate in &authenticable {
         let Some(qualified) = qualify(
             source,
+            &mut spends,
             candidate,
             &qualifying_epoch,
             required_per_store,
@@ -384,8 +423,8 @@ pub fn census<S: ChainSource>(
         owners.insert(triple.owner);
     }
 
-    // Both counts are bounded by `MAX_CANDIDATES` — an entry exists only for a candidate that
-    // survived the expensive pass — so neither conversion can be lossy.
+    // Both counts are at most the number of candidates the source returned, which is a `usize`, so
+    // neither conversion can be lossy.
     let census = EpochCensus {
         epoch,
         stores: selected.len() as u64,
@@ -438,25 +477,66 @@ struct Qualified {
     selection: Selection,
 }
 
-/// Applies the rules whose inputs are already on the coin record: **C2**, **C3** and **C5**.
+/// Applies the rules whose inputs are already on the coin record: **C0** and **C2**, **C3**.
 ///
 /// `true` keeps the candidate for the expensive pass; `false` excludes it and records why.
 ///
-/// Running these first is not merely an optimisation. `authenticate` costs a chain read and two CLVM
-/// executions, and the candidate list is a globally writable set — so screening on data already in
-/// hand is what keeps a dust flood from buying quadratic work on every node, every epoch, forever.
+/// # Every operand here has an established meaning, and that is the whole rule
 ///
-/// C5 is decidable here because a mirror coin's collateral **is** its coin amount
-/// ([`MirrorCoin::collateral`](crate::MirrorCoin::collateral) returns `coin.amount`), which the
-/// record already carries. `qualify` re-checks that equality against the authenticated coin rather
-/// than assuming it, so a source that reported a different amount than the spend creates cannot slip
-/// an under-collateralised coin past the cheap screen.
+/// A comparison is only as sound as the least-established of its two operands, and a threshold is
+/// meaningless until you know what the number counts. So each comparison below is listed with what
+/// establishes it:
+///
+/// | comparison | left operand | right operand | established? |
+/// |---|---|---|---|
+/// | **C0** `puzzle_hash == mirror_coin_puzzle_hash()` | the source's record | this crate's own constant | yes |
+/// | **C2** `confirmed_height <= census_height` | a block height on the source's chain | a block height on the same chain | yes |
+/// | **C3** `spent_height > census_height` | a block height on the source's chain | a block height on the same chain | yes |
+/// | *(filter)* `amount >= required_per_store` | a `u64` in **an unknown asset** | DIG CAT base units | **NO** |
+///
+/// # The last row is why C5 no longer lives here
+///
+/// Nothing on a coin record establishes which asset its `amount` counts. [`mirror_coin_puzzle_hash`]
+/// is a CAT outer hash, but it is still only 32 bytes: an ordinary XCH `CREATE_COIN` paying to it
+/// produces a record there denominated in **mojos**, nine orders of magnitude cheaper per unit, which
+/// clears any reachable requirement for approximately nothing. C0 does not rescue that comparison and
+/// must not be mistaken for doing so — it establishes which puzzle **locks** the coin, never what the
+/// coin **contains**. The asset is established only by the lineage proof inside the creating spend,
+/// which costs the chain read this pass exists to avoid.
+///
+/// So the amount comparison **cannot be made sound here at any price**, and the collateral rule C5
+/// lives in [`qualify`] behind **C1**, where the asset is known.
+///
+/// What remains here is a filter, not a rule, and the distinction is the whole finding. It is sound
+/// in exactly one direction: `qualify` requires `collateral() == coin.amount`, so every coin that
+/// will ultimately qualify has a record amount at or above the requirement, whatever the unit. It can
+/// therefore only ever admit coins that will later be rejected — never drop one that would have
+/// counted. It is kept because dropping it made a single unreadable dust record abort every census
+/// (an absent creating spend fails closed, by design), which is a cheaper denial than the one this
+/// rework removes.
+///
+/// **Nothing security-relevant may rest on it.** In particular it does not guard the bound: that is
+/// denominated in distinct creating spends precisely because no cheap amount comparison can be
+/// trusted to price a flood.
+///
+/// C0 itself is new and is worth stating plainly: the candidate list arrives from the source, and
+/// nothing previously checked that the records it returned are at the puzzle hash that was asked
+/// for.
 fn prescreen(
     candidate: &CoinRecord,
     census_height: u32,
+    mirror_puzzle_hash: Bytes32,
     required_per_store: u64,
     excluded: &mut Exclusions,
 ) -> bool {
+    // C0 — actually at the mirror puzzle hash. The source was asked for this hash; a source that
+    // answers with records at some other one has not been believed about anything yet, and every
+    // rule below reads as a fact about a mirror coin.
+    if candidate.coin.puzzle_hash != mirror_puzzle_hash {
+        excluded.foreign_puzzle += 1;
+        return false;
+    }
+
     // C2 — created at or before the census height.
     let Some(confirmed) = candidate.confirmed_height else {
         excluded.undated += 1;
@@ -477,7 +557,9 @@ fn prescreen(
         return false;
     }
 
-    // C5 — meets that epoch's requirement. Read the module docs before relaxing this.
+    // A one-directional filter, NOT C5. See the operand table above: this number's asset is unknown,
+    // so passing it establishes nothing. Failing it does, because a qualifying coin's collateral IS
+    // its record amount — so this can only discard coins C5 would discard anyway.
     if candidate.coin.amount < required_per_store {
         excluded.under_collateralised += 1;
         return false;
@@ -488,12 +570,19 @@ fn prescreen(
 
 /// Applies the rules that need the coin's creating spend: **C1/C6**, **C4** and **C8**.
 ///
-/// Only ever called on a candidate `prescreen` kept, so C2, C3 and C5 already hold.
+/// Only ever called on a candidate `prescreen` kept, so C0, C2 and C3 already hold.
+///
+/// **C5 is applied here, not in `prescreen`**, and the ordering is load-bearing rather than
+/// incidental: the collateral comparison is only meaningful once C1 has established that the coin's
+/// amount counts DIG CAT base units. A source-reported amount in some other asset is a number
+/// without a unit, and comparing it against a threshold is the defect this ordering exists to make
+/// impossible.
 ///
 /// `Ok(None)` means the coin was read and did not qualify — the reason is recorded in `excluded`.
 /// `Err` means a read could not be answered, which ends the census.
 fn qualify<S: ChainSource>(
     source: &S,
+    spends: &mut SpendCache,
     candidate: &CoinRecord,
     qualifying_epoch: &BigInt,
     required_per_store: u64,
@@ -508,7 +597,7 @@ fn qualify<S: ChainSource>(
     // into `unreadable` would let a pruned source silently report a smaller network, which is the
     // direction that lowers the requirement for everyone, with no attacker involved. A census is
     // complete or absent.
-    let coin = match authenticate(source, candidate) {
+    let coin = match spends.authenticate(source, candidate) {
         Ok(Candidate::Mirror(mirror)) => *mirror,
         Ok(Candidate::NotAMirror | Candidate::UndecodableMemos { .. })
         | Err(MirrorError::NotDigCollateral { .. })

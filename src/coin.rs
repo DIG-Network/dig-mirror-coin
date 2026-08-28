@@ -215,16 +215,7 @@ impl MirrorCoin {
         creating_spend: &CoinSpend,
         coin_id: Bytes32,
     ) -> Result<Candidate, MirrorError> {
-        match Self::read_parent_outputs(creating_spend)? {
-            ParentOutputs::RevealMismatch => Err(MirrorError::Unauthenticated { coin_id }),
-            ParentOutputs::Children(children) => match children.get(&coin_id) {
-                None => Ok(Candidate::NotAMirror),
-                Some(ChildReadout::ForeignAsset { found }) => {
-                    Err(MirrorError::NotDigCollateral { found: *found })
-                }
-                Some(ChildReadout::Classified(candidate)) => Ok(candidate.clone()),
-            },
-        }
+        Self::read_parent_outputs(creating_spend)?.candidate(coin_id)
     }
 
     /// Executes one creating spend **once** and classifies every collateral output it produced.
@@ -295,9 +286,10 @@ impl MirrorCoin {
         let collateral_puzzle_hash = first.coin.puzzle_hash;
         let parent_id = first.coin.parent_coin_info;
 
-        let output = run_puzzle(&mut allocator, parent_puzzle.ptr(), solution_ptr).map_err(
-            |error| MirrorError::Malformed(format!("parent puzzle did not run: {error}")),
-        )?;
+        let output =
+            run_puzzle(&mut allocator, parent_puzzle.ptr(), solution_ptr).map_err(|error| {
+                MirrorError::Malformed(format!("parent puzzle did not run: {error}"))
+            })?;
         let conditions = Conditions::<NodePtr>::from_clvm(&allocator, output)
             .map_err(|error| MirrorError::Malformed(format!("undecodable conditions: {error}")))?;
 
@@ -408,6 +400,26 @@ pub(crate) enum ParentOutputs {
     /// Every collateral output the spend created, keyed by coin id. Empty is a real answer: the
     /// spend created no collateral coins.
     Children(HashMap<Bytes32, ChildReadout>),
+}
+
+impl ParentOutputs {
+    /// The answer for ONE coin id, in the shape every caller needs it.
+    ///
+    /// A coin id this spend produced no output for is `NotAMirror` — the honest answer to "did this
+    /// spend create that coin": no. Kept here rather than at each call site so that a cached readout
+    /// and a freshly executed one cannot drift apart in how they are interpreted.
+    pub(crate) fn candidate(&self, coin_id: Bytes32) -> Result<Candidate, MirrorError> {
+        match self {
+            Self::RevealMismatch => Err(MirrorError::Unauthenticated { coin_id }),
+            Self::Children(children) => match children.get(&coin_id) {
+                None => Ok(Candidate::NotAMirror),
+                Some(ChildReadout::ForeignAsset { found }) => {
+                    Err(MirrorError::NotDigCollateral { found: *found })
+                }
+                Some(ChildReadout::Classified(candidate)) => Ok(candidate.clone()),
+            },
+        }
+    }
 }
 
 /// What one collateral output of a spend turned out to be.
