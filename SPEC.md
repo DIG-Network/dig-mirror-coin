@@ -104,8 +104,18 @@ consumer holding only a coin close the loop without trusting whoever supplied it
 ## 5. Authentication
 
 A candidate coin MUST be re-derived from the spend that CREATED it — the parent's puzzle reveal run
-against its solution — before any property of it is believed. From that execution an implementation
-MUST take:
+against its solution — before any property of it is believed.
+
+The reveal MUST first be bound to the coin it claims to belong to: its tree hash MUST equal that
+coin's puzzle hash, and an implementation MUST reject the spend otherwise, per §7 — a reveal a source
+supplied and nothing checked is not chain evidence. Every property below is read out of the reveal,
+including the owner, so an unbound reveal lets whoever supplies the spend choose all of them. The
+coin-id match that selects among a parent's several outputs does NOT establish this: a child's coin id
+is a hash of the parent's id, the mirror puzzle hash and the amount, and the parent's inner puzzle
+appears in none of them, so a substituted reveal leaves the coin id identical while re-attributing the
+coin.
+
+From that execution an implementation MUST take:
 
 - the **asset id**, from the parent's curried CAT puzzle. It MUST equal the $DIG asset id.
 - the **amount**, from the matching `CREATE_COIN` condition.
@@ -365,9 +375,32 @@ computes, produced silently. An implementation MUST return an error and no censu
 A coin that was read successfully and failed a rule is the opposite case: that is an answer, and an
 implementation MUST count it as an exclusion and continue.
 
-An implementation MUST bound the population it examines, and MUST disclose to the caller when that
-bound was reached — a truncated census is a census of an arbitrary prefix of the network and MUST NOT
-be fed to the controller.
+A creating spend the source did not produce is NOT such an answer. It is an unanswerable read per §7,
+and a census MUST fail closed on it rather than counting the coin as unreadable and completing —
+otherwise a pruned source silently reports a smaller network, which is the direction that lowers the
+requirement for everyone, with no attacker involved. This is where a census MUST diverge from `list`
+(§6.2), whose tolerance is correct for a different question.
+
+### 8.8 The census bound is a REFUSAL, and here that is the opposite of §6.5
+
+A census MUST examine the ENTIRE candidate population. It MUST NOT compute a census over a prefix of
+it, and MUST NOT return a census that did.
+
+This inverts §6.5 deliberately, and the reason is the population rather than the bound. A query walks
+one owner's or one advertisement's hint bucket, where a truncated answer is still an honest partial
+answer to the caller's own question. A census walks the single global mirror puzzle hash — a set
+anyone may add to for the price of a dust coin, and one that never shrinks because spent coins are
+included per C3. A prefix of that set is a censorship primitive: enough dust erases an honest network
+from every node permanently, and two nodes whose sources enumerate differently take different
+prefixes and compute different requirements from the same chain.
+
+An implementation MAY bound the work it does per candidate. Where a bound is exceeded it MUST report
+that it could not compute the census, and MUST NOT return a census — a node that says it cannot
+compute the network is recoverable, and a node that quietly computes a smaller one is not.
+
+Rules decidable from the coin record alone — C2, C3 and C5 — SHOULD be applied to the whole
+population before any rule requiring a further chain read, so that the population an implementation
+must bound is the collateralised one rather than the free one.
 
 ## 9. Conformance
 
@@ -402,4 +435,13 @@ An implementation conforms when:
 16. its census excludes a coin whose declaration does not reproduce its hint under the owner from its
     lineage proof (§8.2 C8);
 17. its census reports an epoch within the finality depth of the tip as pending rather than final
-    (§8.6), and errors rather than shrinking when a read cannot be answered (§8.7).
+    (§8.6), and errors rather than shrinking when a read cannot be answered (§8.7);
+18. its census returns the SAME result for a population whichever order a source enumerates it in,
+    including when an honest coin sits past the point a bound would have stopped at (§8.8);
+19. its census refuses to answer, rather than answering over a prefix, when its per-candidate bound
+    is exceeded — and does not refuse a population exactly at that bound (§8.8);
+20. a flood of coins below the epoch requirement does not consume its census bound (§8.8);
+21. its census fails closed when a candidate's creating spend cannot be produced, while `list`
+    continues to report the same coin as unresolved (§8.7, §6.2);
+22. a puzzle reveal substituted onto a real coin cannot re-attribute that coin's owner, store or
+    root, and the same coin with its genuine spend is still attributed (§5, §7).
