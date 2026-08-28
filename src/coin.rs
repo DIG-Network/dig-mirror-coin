@@ -26,6 +26,7 @@ use chia_puzzle_types::{LineageProof, Memos};
 use chia_sdk_driver::{P2ParentCoin, Puzzle};
 use chia_sdk_types::{run_puzzle, Condition, Conditions};
 use clvm_traits::{FromClvm, ToClvm};
+use clvm_utils::tree_hash;
 use clvmr::{Allocator, NodePtr};
 use num_bigint::BigInt;
 
@@ -224,6 +225,23 @@ impl MirrorCoin {
             .solution
             .to_clvm(&mut allocator)
             .map_err(|error| MirrorError::Malformed(format!("undecodable solution: {error}")))?;
+
+        // The reveal must be the parent coin's ACTUAL puzzle, and nothing below re-derives that.
+        //
+        // Everything this function establishes is read out of this reveal: `parse_child` takes the
+        // owner from the reveal's curried inner puzzle, and the store, root and epoch come from
+        // running it. The coin-id match further down does NOT cover it — a child's coin id is a hash
+        // of the parent's id, the mirror puzzle hash and the amount, none of which involve the
+        // parent's inner puzzle — so a substituted reveal keeps the coin id intact while choosing a
+        // different owner, store and root for a real coin. C8 stays silent through that, because the
+        // hint is recomputed from the very values the substitution chose.
+        //
+        // Chia consensus binds a reveal to its coin for any spend that actually happened. This crate
+        // does not get to assume the source returned one that did. SPEC section 7.
+        let revealed: Bytes32 = tree_hash(&allocator, puzzle_ptr).into();
+        if revealed != creating_spend.coin.puzzle_hash {
+            return Err(MirrorError::Unauthenticated { coin_id });
+        }
 
         let parent_puzzle = Puzzle::parse(&allocator, puzzle_ptr);
         let Some((first, first_memos)) = P2ParentCoin::parse_child(
