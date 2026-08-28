@@ -21,6 +21,8 @@
 //! solve for a value that lands a coin bonding their own store on anyone else's hint. Under that
 //! construction one stake would back unlimited claims. The declaration is what pins it to one.
 
+use std::collections::HashMap;
+
 use chia_protocol::{Bytes, Bytes32, Coin, CoinSpend};
 use chia_puzzle_types::{LineageProof, Memos};
 use chia_sdk_driver::{P2ParentCoin, Puzzle};
@@ -213,6 +215,34 @@ impl MirrorCoin {
         creating_spend: &CoinSpend,
         coin_id: Bytes32,
     ) -> Result<Candidate, MirrorError> {
+        match Self::read_parent_outputs(creating_spend)? {
+            ParentOutputs::RevealMismatch => Err(MirrorError::Unauthenticated { coin_id }),
+            ParentOutputs::Children(children) => match children.get(&coin_id) {
+                None => Ok(Candidate::NotAMirror),
+                Some(ChildReadout::ForeignAsset { found }) => {
+                    Err(MirrorError::NotDigCollateral { found: *found })
+                }
+                Some(ChildReadout::Classified(candidate)) => Ok(candidate.clone()),
+            },
+        }
+    }
+
+    /// Executes one creating spend **once** and classifies every collateral output it produced.
+    ///
+    /// # Why this is keyed by the spend rather than by the coin
+    ///
+    /// Running a parent's puzzle is the expensive half of authentication, and its cost does not
+    /// depend on which child is being asked about — the same execution answers for all of them. A
+    /// per-coin entry point therefore re-runs one spend once per output, so a single transaction
+    /// creating `n` collateral coins costs `n` executions of a puzzle that emits `n` conditions.
+    /// That is quadratic in a quantity an attacker chooses, bought with one transaction.
+    ///
+    /// Reading the parent once makes the work **linear in the number of distinct creating spends**,
+    /// which is the quantity a caller can bound and an attacker must pay the chain for. `census`
+    /// bounds exactly that; see [`CensusOutcome::Incomplete`](crate::CensusOutcome::Incomplete).
+    pub(crate) fn read_parent_outputs(
+        creating_spend: &CoinSpend,
+    ) -> Result<ParentOutputs, MirrorError> {
         let mut allocator = Allocator::new();
 
         let puzzle_ptr = creating_spend
@@ -240,49 +270,72 @@ impl MirrorCoin {
         // does not get to assume the source returned one that did. SPEC section 7.
         let revealed: Bytes32 = tree_hash(&allocator, puzzle_ptr).into();
         if revealed != creating_spend.coin.puzzle_hash {
-            return Err(MirrorError::Unauthenticated { coin_id });
+            return Ok(ParentOutputs::RevealMismatch);
         }
 
         let parent_puzzle = Puzzle::parse(&allocator, puzzle_ptr);
-        let Some((first, first_memos)) = P2ParentCoin::parse_child(
+        let Some((first, _)) = P2ParentCoin::parse_child(
             &mut allocator,
             creating_spend.coin,
             parent_puzzle,
             solution_ptr,
         )?
         else {
-            return Ok(Candidate::NotAMirror);
+            return Ok(ParentOutputs::Children(HashMap::new()));
         };
 
         // `parse_child` answers with the parent's FIRST output at the collateral puzzle hash, which
         // is the wrong one whenever a spend created more than one. That is not hypothetical: a
         // consumer batching several advertisements into one transaction produces exactly this shape,
-        // and each of those coins locks its owner's $DIG. Selecting by coin id rather than by
-        // position is what keeps the later ones from vanishing while their collateral stays locked.
-        let (inner, memos) = if first.coin.coin_id() == coin_id {
-            (first, first_memos)
-        } else {
-            let Some(sibling) =
-                sibling_child(&mut allocator, &first, parent_puzzle, solution_ptr, coin_id)?
-            else {
-                return Ok(Candidate::NotAMirror);
-            };
-            sibling
-        };
+        // and each of those coins locks its owner's $DIG. Every output is enumerated and keyed by
+        // its coin id, so the later ones cannot vanish while their collateral stays locked.
+        //
+        // The asset id and the lineage proof are properties of the PARENT, so they are shared by
+        // every output it created; only the amount and the memos differ per child.
+        let collateral_puzzle_hash = first.coin.puzzle_hash;
+        let parent_id = first.coin.parent_coin_info;
 
+        let output = run_puzzle(&mut allocator, parent_puzzle.ptr(), solution_ptr).map_err(
+            |error| MirrorError::Malformed(format!("parent puzzle did not run: {error}")),
+        )?;
+        let conditions = Conditions::<NodePtr>::from_clvm(&allocator, output)
+            .map_err(|error| MirrorError::Malformed(format!("undecodable conditions: {error}")))?;
+
+        let mut children: HashMap<Bytes32, ChildReadout> = HashMap::new();
+        for condition in conditions {
+            let Condition::CreateCoin(created) = condition else {
+                continue;
+            };
+            if created.puzzle_hash != collateral_puzzle_hash {
+                continue;
+            }
+
+            let coin = Coin::new(parent_id, collateral_puzzle_hash, created.amount);
+            let inner = P2ParentCoin::new(coin, first.asset_id, first.proof);
+            // Two identical `CREATE_COIN`s are one coin on chain, so the first reading stands.
+            children
+                .entry(coin.coin_id())
+                .or_insert_with(|| Self::read_child(&allocator, inner, created.memos));
+        }
+
+        Ok(ParentOutputs::Children(children))
+    }
+
+    /// Classifies ONE already-located collateral output. Runs no CLVM of its own.
+    fn read_child(allocator: &Allocator, inner: P2ParentCoin, memos: Memos) -> ChildReadout {
         if inner.asset_id != Some(DIG_ASSET_ID) {
-            return Err(MirrorError::NotDigCollateral {
+            return ChildReadout::ForeignAsset {
                 found: inner.asset_id,
-            });
+            };
         }
 
         // The owner is settled from here on, whatever the memos turn out to hold.
         let owner_puzzle_hash = inner.proof.parent_inner_puzzle_hash;
 
-        let decoded = match parse_memos(&allocator, memos) {
+        let decoded = match parse_memos(allocator, memos) {
             Ok(decoded) => decoded,
             Err(detail) => {
-                return Ok(Candidate::UndecodableMemos {
+                return ChildReadout::Classified(Candidate::UndecodableMemos {
                     owner_puzzle_hash,
                     detail,
                 })
@@ -290,10 +343,10 @@ impl MirrorCoin {
         };
 
         let Some((namespace_hint, declared, urls)) = decoded else {
-            return Ok(Candidate::NotAMirror);
+            return ChildReadout::Classified(Candidate::NotAMirror);
         };
 
-        Ok(Candidate::Mirror(Box::new(Self {
+        ChildReadout::Classified(Candidate::Mirror(Box::new(Self {
             inner,
             namespace_hint,
             declared,
@@ -312,6 +365,7 @@ impl MirrorCoin {
 /// The three cases are not three flavours of failure. They differ in **what was established**, and a
 /// caller can only act correctly if that difference survives the return: two of them are settled
 /// answers and one is a genuine gap in knowledge.
+#[derive(Clone)]
 pub(crate) enum Candidate {
     /// A mirror coin, fully re-derived from executed on-chain code.
     ///
@@ -342,50 +396,33 @@ pub(crate) enum Candidate {
     },
 }
 
-/// Finds a LATER collateral output of the same parent spend — the one whose coin id is `coin_id`.
+/// Everything one executed creating spend established about the collateral outputs it produced.
 ///
-/// Reached only when the parent created more than one collateral coin and the caller asked about a
-/// coin other than the first. Everything that authenticates the coin — the asset id, the lineage
-/// proof, the collateral puzzle hash — is taken from `first`, the child the canonical
-/// [`P2ParentCoin::parse_child`] already derived, so this function decides *which output* and
-/// nothing else. Re-deriving those values here would be a second copy of upstream's CAT-argument
-/// handling, free to drift from it.
+/// [`Self::RevealMismatch`] is an answer about the SPEND rather than about any child: the reveal did
+/// not hash to the parent coin's puzzle hash, so nothing the execution produced can be attributed to
+/// the parent at all. It is returned rather than raised because the error a caller needs names the
+/// coin it asked about, and this function was not told one.
+pub(crate) enum ParentOutputs {
+    /// The puzzle reveal is not the parent coin's actual puzzle.
+    RevealMismatch,
+    /// Every collateral output the spend created, keyed by coin id. Empty is a real answer: the
+    /// spend created no collateral coins.
+    Children(HashMap<Bytes32, ChildReadout>),
+}
+
+/// What one collateral output of a spend turned out to be.
 ///
-/// Returns `Ok(None)` when no output of this spend has that coin id, which is the honest answer to
-/// "did this spend create that coin": no.
-fn sibling_child(
-    allocator: &mut Allocator,
-    first: &P2ParentCoin,
-    parent_puzzle: Puzzle,
-    parent_solution: NodePtr,
-    coin_id: Bytes32,
-) -> Result<Option<(P2ParentCoin, Memos)>, MirrorError> {
-    let collateral_puzzle_hash = first.coin.puzzle_hash;
-    let parent_id = first.coin.parent_coin_info;
-
-    let output = run_puzzle(allocator, parent_puzzle.ptr(), parent_solution)
-        .map_err(|error| MirrorError::Malformed(format!("parent puzzle did not run: {error}")))?;
-    let conditions = Conditions::<NodePtr>::from_clvm(allocator, output)
-        .map_err(|error| MirrorError::Malformed(format!("undecodable conditions: {error}")))?;
-
-    for condition in conditions {
-        let Condition::CreateCoin(created) = condition else {
-            continue;
-        };
-        if created.puzzle_hash != collateral_puzzle_hash {
-            continue;
-        }
-
-        let sibling = Coin::new(parent_id, collateral_puzzle_hash, created.amount);
-        if sibling.coin_id() == coin_id {
-            return Ok(Some((
-                P2ParentCoin::new(sibling, first.asset_id, first.proof),
-                created.memos,
-            )));
-        }
-    }
-
-    Ok(None)
+/// [`Self::ForeignAsset`] is kept apart from [`Candidate`] because it is not a fact about a mirror
+/// coin — it says the output locks collateral in some asset that is not $DIG, which callers surface
+/// as [`MirrorError::NotDigCollateral`] rather than as an answer of "no".
+pub(crate) enum ChildReadout {
+    /// Read as far as it could be read. See [`Candidate`].
+    Classified(Candidate),
+    /// Collateral in an asset other than $DIG, or no CAT asset at all.
+    ForeignAsset {
+        /// The asset id found, if the output carried one.
+        found: Option<Bytes32>,
+    },
 }
 
 /// Splits a mirror coin's memos into its namespace value, its declared advertisement, and its URLs.
