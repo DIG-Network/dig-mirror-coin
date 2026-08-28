@@ -1030,3 +1030,65 @@ fn dust_does_not_consume_the_bound_it_is_screened_before_it() {
         MAX_CANDIDATES * 2
     );
 }
+
+// ---------------------------------------------------------------------------
+// T1 - the creating spend's reveal must be the coin's own puzzle
+// ---------------------------------------------------------------------------
+
+/// A real coin re-attributed to a chosen owner, with a chosen store and root, by substituting the
+/// puzzle reveal of a DIFFERENT owner's spend onto it.
+///
+/// The substitution survives every check that came before it. The parent coin is untouched, so the
+/// child's coin id - a hash of the parent's id, the mirror puzzle hash and the amount - is bit for
+/// bit the one the record carries, and C8 is silent because the hint it recomputes is built from the
+/// substituted store, root and epoch.
+///
+/// The honest coin beside it is the control: the census must be REFUSED, not merely emptied, and a
+/// rule that over-reaches would take the honest coin with it.
+#[test]
+fn a_reveal_substituted_onto_a_real_coin_cannot_re_attribute_it() {
+    let victim = wallet(1);
+    let attacker = wallet(2);
+
+    let honest = mirror_memos(&victim, store_a(), root_1(), &["https://mirror.example"]);
+    let (genuine, coin) = creating_spend_of_amount(&victim, &honest, AT_REQUIREMENT);
+
+    let chosen = mirror_memos(&attacker, store_b(), root_2(), &["https://mirror.example"]);
+    let (substitute, _) = creating_spend_of_amount(&attacker, &chosen, AT_REQUIREMENT);
+
+    let forged = CoinSpend {
+        coin: genuine.coin,
+        puzzle_reveal: substitute.puzzle_reveal,
+        solution: substitute.solution,
+    };
+
+    let mut chain = CensusChain::new();
+    publish_qualifying(&mut chain, &wallet(3), store_a(), root_2(), AT_REQUIREMENT);
+    chain.publish(forged, coin, CENSUS_AT - 10, None);
+
+    assert!(
+        census(&chain, &prior_record(), at(CENSUS_AT)).is_err(),
+        "a reveal that is not the coin's own puzzle must not be able to speak for it"
+    );
+}
+
+/// The control for the test above: the same coin with its GENUINE creating spend is attributed to
+/// the owner who actually made it, and the census completes.
+///
+/// Without this, a check that rejected every spend would look identical to a check that rejects only
+/// substituted ones.
+#[test]
+fn the_same_coin_with_its_genuine_spend_is_attributed_and_the_census_completes() {
+    let victim = wallet(1);
+    let honest = mirror_memos(&victim, store_a(), root_1(), &["https://mirror.example"]);
+    let (genuine, coin) = creating_spend_of_amount(&victim, &honest, AT_REQUIREMENT);
+
+    let mut chain = CensusChain::new();
+    publish_qualifying(&mut chain, &wallet(3), store_a(), root_2(), AT_REQUIREMENT);
+    chain.publish(genuine, coin, CENSUS_AT - 10, None);
+
+    let census = run(&chain);
+
+    assert_eq!(census.census().stores, 2);
+    assert_eq!(census.census().owners, 2);
+}
