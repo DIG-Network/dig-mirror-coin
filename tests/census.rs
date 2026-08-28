@@ -38,6 +38,13 @@ const CENSUS_AT: u32 = 1_000;
 /// testable from
 /// both sides rather than only from the side that happens to pass.
 const REQUIREMENT: u64 = 1_000_000;
+/// The prior epoch's BASE PRICE, deliberately a different number from [`REQUIREMENT`].
+///
+/// The census reads `required_per_store_dig_base_units` and must never read the base price. While
+/// both fields held the same value a fixture could not tell the two apart, so swapping which one
+/// the census reads left the whole suite green. Half the requirement is far enough that a swap
+/// makes `AT_REQUIREMENT` and `BELOW_REQUIREMENT` both qualify, which several tests then catch.
+const BASE_PRICE: u64 = REQUIREMENT / 2;
 const AT_REQUIREMENT: u64 = REQUIREMENT;
 const BELOW_REQUIREMENT: u64 = REQUIREMENT - 1;
 const ABOVE_REQUIREMENT: u64 = REQUIREMENT + 500;
@@ -65,7 +72,7 @@ fn prior_record() -> EpochRecord {
         band: None,
         multiplier_micros: 1_000_000,
         handicap_dig_base_units: 0,
-        base_price_dig_base_units: REQUIREMENT,
+        base_price_dig_base_units: BASE_PRICE,
         required_per_store_dig_base_units: REQUIREMENT,
     }
 }
@@ -623,24 +630,17 @@ fn a_coin_below_the_requirement_contributes_to_nothing_while_an_honest_one_still
         1,
         "the cheap filter caught it, so it never reached C1 and its asset was never established"
     );
-    assert_eq!(
-        census.excluded().under_collateralised,
-        0,
-        "C5 is measured behind C1 and this coin never got there"
-    );
 }
 
-/// The counters must not be interchangeable, and one fixture holding both populations is the only
-/// way to see that they are not.
+/// Dust in a foreign asset is noise, and it must not be reported as anything stronger.
 ///
 /// The XCH coin costs one mojo below the requirement — nine orders of magnitude cheaper per unit
-/// than a DIG base unit — and anyone can mint them by the thousand. If it were counted into
-/// `under_collateralised`, that field's own rustdoc would be false: it promises a count measured
-/// against the AUTHENTICATED coin, which is what an operator reads as "$DIG holders are falling
-/// short". The honest mirror coin beside it is the second actor: a single-counter implementation
-/// makes the two indistinguishable, and only a fixture holding both can tell.
+/// than a DIG base unit — and anyone can mint them by the thousand, so its only honest home is the
+/// unauthenticated noise counter. Two actors, not one: the honest mirror coin beside it must still
+/// count, or a test asserting "the dust was excluded" would pass just as well against a census that
+/// excluded everything.
 #[test]
-fn an_xch_coin_below_the_requirement_is_not_counted_as_under_collateralised_dig() {
+fn xch_dust_at_the_mirror_hash_is_counted_as_noise_and_nothing_stronger() {
     let mut chain = CensusChain::new();
     publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
 
@@ -657,9 +657,9 @@ fn an_xch_coin_below_the_requirement_is_not_counted_as_under_collateralised_dig(
         "the XCH coin is noise at the shared puzzle hash"
     );
     assert_eq!(
-        census.excluded().under_collateralised,
+        census.excluded().unreadable,
         0,
-        "and it is emphatically not an authenticated $DIG coin that fell short"
+        "and it never reached C1, so it is not a coin whose memos failed to read either"
     );
 }
 
@@ -672,7 +672,7 @@ fn a_coin_exactly_at_the_requirement_qualifies() {
     publish_qualifying(&mut chain, &wallet(1), store_a(), root_1(), AT_REQUIREMENT);
 
     assert_eq!(run(&chain).census().stores, 1);
-    assert_eq!(run(&chain).excluded().under_collateralised, 0);
+    assert_eq!(run(&chain).excluded().below_requirement_unauthenticated, 0);
 }
 
 /// A flood of dust cannot move any of the three outputs. This is the attack C5 exists to stop,

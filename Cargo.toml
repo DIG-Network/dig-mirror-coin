@@ -16,6 +16,12 @@ readme = "README.md"
 keywords = ["chia", "dig", "cat", "collateral", "mirror"]
 categories = ["cryptography::cryptocurrencies"]
 
+# Agent instructions are not part of the crate. Without this they ride into the published tarball,
+# which is IMMUTABLE — `cargo package --list` showed six `.claude/skills/**/SKILL.md` plus
+# `AGENTS.md` and `CLAUDE.md` shipping to every consumer of 0.7.0. Re-run `cargo package --list`
+# after touching this list; it is the only thing that proves the exclusion still bites.
+exclude = [".claude", "AGENTS.md", "CLAUDE.md"]
+
 [dependencies]
 dig-chainsource-interface = "0.3.2"
 dig-mirror-collateral = "0.3.0"

@@ -311,11 +311,17 @@ A coin at `H(n)` qualifies for the census of epoch `n` when all of the following
 - **C0b** — the record is **not a block-reward (coinbase) coin**. Such a coin has no creating spend
   on any source, so it can never satisfy C1 and MUST NOT be allowed to make the census unanswerable
   (§8.7). An implementation MUST decide this from the coin record alone, before any chain read. A
-  source's coinbase flag, where it populates one, is authoritative; where it does not, an
-  implementation SHOULD additionally recognise the synthesised parent's shape — consensus builds it
-  as sixteen bytes of the genesis challenge followed by the block height as a sixteen-byte big-endian
-  integer, so the bytes at offsets 16..28 are zero for every reachable height, which a coin id (a
-  SHA-256 output) matches only with negligible probability.
+  source's coinbase flag, where it populates one, is authoritative; because a source need not
+  populate one, an implementation MUST additionally recognise the synthesised parent's shape, and
+  MUST NOT rest C0b on the flag alone. §9 requires such a coin to be excluded rather than failed
+  closed on, and a flag-only implementation cannot meet that requirement against a source that
+  reports every reward coin as `coinbase: false` while knowing no better — which is every source
+  deriving its records from a wallet-protocol coin state, since that message carries no such flag.
+  Consensus builds the synthesised parent as sixteen bytes of the genesis challenge followed by the block height as a sixteen-byte
+  big-endian integer, so the bytes at offsets 16..28 are zero for every reachable height, which a
+  coin id (a SHA-256 output) matches only with negligible probability. The detector is safe in the
+  one direction that matters: it can only ever discard a coin, and the coins it discards could not
+  have qualified.
 - **C1** — its collateral is **$DIG**, established from the lineage proof in its creating spend.
   C0 does not imply C1 and MUST NOT be treated as implying it: the mirror puzzle hash is a CAT outer
   hash, but it is still 32 bytes, and an ordinary XCH `CREATE_COIN` paying to it produces a record

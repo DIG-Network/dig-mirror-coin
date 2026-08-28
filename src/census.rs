@@ -85,6 +85,7 @@ pub struct CensusHeight {
 /// census whose every candidate failed one rule unless the failures are reported, and those two
 /// situations call for very different responses from an operator.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Exclusions {
     /// **C0** — the source returned a record that is not at the mirror puzzle hash it was asked
     /// for. A fact about the source, not about the chain; nothing else here would have been safe to
@@ -108,32 +109,18 @@ pub struct Exclusions {
     pub undated: u64,
     /// **C4** — declares an epoch other than the one being qualified against.
     pub wrong_epoch: u64,
-    /// **C5** — locks less than that epoch's requirement, measured against the AUTHENTICATED coin.
-    /// See the module docs: these are invisible, never evidence.
-    ///
-    /// Only ever counted behind C1, because an amount whose asset is unknown is a number without a
-    /// unit and cannot be compared against a threshold denominated in DIG CAT base units. The cheap
-    /// filter that runs before C1 counts into
-    /// [`below_requirement_unauthenticated`](Self::below_requirement_unauthenticated) instead, and
-    /// the two are kept apart because only one of them is about $DIG.
-    ///
-    /// **What actually reaches here, stated so nobody reads more into it than it carries.** The
-    /// prescreen has already discarded every record whose amount is below the requirement, so a coin
-    /// arriving at C1 has `record.amount >= required`. It can then fail C5 only if its authenticated
-    /// collateral differs from the amount its record advertised — that is, the source *misreported*
-    /// the amount. So this counts sources caught lying about an amount, not honest mirrors that fell
-    /// short.
-    ///
-    /// **Neither counter is the "the network cannot afford the requirement" signal**, and this crate
-    /// does not produce one. An honest mirror below the requirement is indistinguishable, without a
-    /// chain read, from an XCH `CREATE_COIN` paying one mojo to the same puzzle hash; both land in
-    /// the unauthenticated counter. Reading either as hardship is the mistake the module docs warn
-    /// about, because the cheaper of those two shapes is the one an attacker mass-produces.
-    pub under_collateralised: u64,
     /// Discarded by the cheap prescreen filter for carrying a record amount below the requirement,
     /// **before** any chain read and therefore **before the asset is established**.
     ///
-    /// Not C5 and deliberately not folded into [`under_collateralised`](Self::under_collateralised).
+    /// **C5's counterpart, and deliberately not a C5 counter. There is no C5 counter, and the
+    /// absence is the honest reporting choice**: every coin this crate can observe failing the
+    /// requirement fails it *here*, before its asset is established, so a separate field counting
+    /// authenticated shortfalls could only ever read zero. A public counter that is structurally
+    /// always zero is not a measurement — an operator reading `0` would conclude "no
+    /// under-collateralised stores" when the truth is "this crate cannot observe that". The
+    /// invariant that makes the count impossible is still enforced, in `qualify`; it just does not
+    /// pretend to be an instrument.
+    ///
     /// The asset behind these amounts is unknown: an ordinary XCH `CREATE_COIN` paying the mirror
     /// puzzle hash one mojo below the requirement lands here, nine orders of magnitude cheaper per
     /// unit than a DIG base unit. Anyone can drive this counter arbitrarily high for approximately
@@ -142,6 +129,10 @@ pub struct Exclusions {
     pub below_requirement_unauthenticated: u64,
     /// **C1/C6** — not a mirror coin at all, or its memos could not be read: a sibling collateral
     /// coin, a stranger's dust, collateral in some other asset, or an absent creating spend.
+    ///
+    /// Also where a record that disagrees with the chain lands: a source reporting an amount its
+    /// coin's creating spend never produced has described a coin that does not exist, which is a
+    /// fact about the source and not about the collateralised network.
     pub unreadable: u64,
     /// **C8** — the coin's declared advertisement does not reproduce the hint it was published
     /// under, so its owner attribution is unproven. Never attributed on a guess.
@@ -693,10 +684,27 @@ fn qualify<S: ChainSource>(
         Err(reason) => return Err(reason),
     };
 
-    // The equality `prescreen` relied on, checked rather than assumed: the amount the record carried
-    // is the amount the creating spend actually produced.
+    // C5, checked rather than assumed — and STRUCTURALLY UNREACHABLE, which is stated here rather
+    // than left for a reader to rediscover.
+    //
+    // Neither disjunct can fire. `prescreen` has already discarded every record whose amount is
+    // below the requirement, so the second is implied by the first. And the first compares the
+    // record's amount against the coin its own creating spend produced, looked up BY COIN ID — and
+    // a coin id is `sha256(parent ‖ puzzle_hash ‖ amount)`, so a record reaching here with a
+    // different amount would be a SHA-256 collision. A source that simply lies about an amount
+    // describes a coin whose id does not resolve, and lands in `unreadable` above.
+    //
+    // It is kept because it costs one comparison and is the only place the equality `prescreen`
+    // depends on is written down as an executable claim. It is counted as `unreadable` rather than
+    // into a C5 counter of its own: a counter no reachable path can increment reports nothing while
+    // looking like a measurement.
+    //
+    // It must NOT be made to fail closed. A tampered record is indistinguishable from a genuine
+    // stranger coin whose parent spend created no matching output, and failing closed on that
+    // reinstates the dust denial this crate removed — a hostile source can already delete any coin
+    // for free by omission.
     if coin.collateral() != candidate.coin.amount || coin.collateral() < required_per_store {
-        excluded.under_collateralised += 1;
+        excluded.unreadable += 1;
         return Ok(None);
     }
 
