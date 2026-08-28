@@ -308,6 +308,14 @@ A coin at `H(n)` qualifies for the census of epoch `n` when all of the following
 
 - **C0** — the record is at the mirror puzzle hash (§3.1). A source MAY return records it was not
   asked for, and an implementation MUST NOT read any other rule off such a record.
+- **C0b** — the record is **not a block-reward (coinbase) coin**. Such a coin has no creating spend
+  on any source, so it can never satisfy C1 and MUST NOT be allowed to make the census unanswerable
+  (§8.7). An implementation MUST decide this from the coin record alone, before any chain read. A
+  source's coinbase flag, where it populates one, is authoritative; where it does not, an
+  implementation SHOULD additionally recognise the synthesised parent's shape — consensus builds it
+  as sixteen bytes of the genesis challenge followed by the block height as a sixteen-byte big-endian
+  integer, so the bytes at offsets 16..28 are zero for every reachable height, which a coin id (a
+  SHA-256 output) matches only with negligible probability.
 - **C1** — its collateral is **$DIG**, established from the lineage proof in its creating spend.
   C0 does not imply C1 and MUST NOT be treated as implying it: the mirror puzzle hash is a CAT outer
   hash, but it is still 32 bytes, and an ordinary XCH `CREATE_COIN` paying to it produces a record
@@ -391,6 +399,21 @@ otherwise a pruned source silently reports a smaller network, which is the direc
 requirement for everyone, with no attacker involved. This is where a census MUST diverge from `list`
 (§6.2), whose tolerance is correct for a different question.
 
+**Exactly one shape is exempt, and it is exempt because no source could ever answer for it.** The
+rule above rests on the possibility of a better source: a spend absent from one source may be present
+in another, so failing closed preserves the chance of a complete answer. A **block-reward** coin
+breaks that premise. Consensus synthesises its `parent_coin_info` rather than deriving it from a
+spent coin, so it is not the coin id of any coin and no creating spend for it exists on a perfect,
+complete, unpruned node. An implementation MUST exclude such a coin under **C0b** (§8.2) instead of
+failing closed on it.
+
+An implementation that does not MUST be understood to be permanently deniable at negligible cost. A
+farmer's or pool's reward target is free-form configuration validated against nothing, so directing
+it at the mirror puzzle hash costs one block; the resulting coin is never spent, so C3 never begins
+excluding it, and every census at every subsequent height on every node returns an error for good.
+The requirement then freezes, which is the direction that cannot be recovered from — per §8.4 the
+requirement that would price an attacker out can only rise via a census.
+
 A spend **of a different coin** is such an unanswerable read, and is the case an implementation is
 most likely to miss. An implementation MUST verify that the returned spend's coin id equals the
 candidate's `parent_coin_info` before interpreting it. Without that check, the spend classifies
@@ -427,7 +450,7 @@ expensive pass performs — one execution answers for every output that spend pr
 an attacker must get on chain per unit of work forced. An implementation that bounds this way MUST
 execute each creating spend at most once per census, or the bound does not bound the work.
 
-Rules decidable from the coin record alone — C0, C2 and C3 — SHOULD be applied to the whole
+Rules decidable from the coin record alone — C0, C0b, C2 and C3 — SHOULD be applied to the whole
 population before any rule requiring a further chain read.
 
 ## 9. Conformance
@@ -476,5 +499,8 @@ An implementation conforms when:
     root, and the same coin with its genuine spend is still attributed (§5, §7);
 23. its census excludes a record the source returned that is not at the mirror puzzle hash, without
     fetching a creating spend for it, and still counts an honest coin beside it (§8.2 C0);
+  - excludes a block-reward coin paid to the mirror puzzle hash — including one a source reports
+    without a coinbase flag — and completes the census rather than failing closed on it (§8.2 C0b,
+    §8.7);
 24. its census ends, rather than excluding the coin and completing, when a source answers a
     candidate's creating-spend read with a different coin's genuine spend (§8.7).

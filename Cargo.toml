@@ -6,7 +6,7 @@
 # never pulls a network stack down into itself.
 [package]
 name = "dig-mirror-coin"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.81.0"
 description = "Mirror coins: lock $DIG as collateral to advertise a DIG store mirror on Chia — create, list, discover, reclaim"
@@ -18,7 +18,7 @@ categories = ["cryptography::cryptocurrencies"]
 
 [dependencies]
 dig-chainsource-interface = "0.3.2"
-dig-mirror-collateral = "0.2.0"
+dig-mirror-collateral = "0.3.0"
 
 # The chia line is the chia-wallet-sdk ceiling, and the ceiling is NOT one number: the primitives,
 # the SDK crates, `chia-puzzles` and `clvmr` each cap at a different version. Normalising them to a
