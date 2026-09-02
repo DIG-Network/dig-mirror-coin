@@ -18,13 +18,20 @@ use clvmr::Allocator;
 use dig_chainsource_interface::{ChainSource, ChainSourceError, CoinRecord, SingletonLineage};
 use dig_mirror_coin::{
     create, discover, list, mirror_coin_puzzle_hash, mirror_hint, query::MirrorChainSource,
-    reclaim, MirrorAdvertisement, MirrorError, SkipReason, DIG_ASSET_ID, MAX_CANDIDATES,
+    reclaim, MirrorAdvertisement, MirrorError, PeerDeclaration, SkipReason, DIG_ASSET_ID,
+    MAX_CANDIDATES,
 };
 use num_bigint::BigInt;
 
 mod support;
 
 use support::*;
+
+/// The peer the `create` fixture declares its collateral stands behind.
+const PUBLISHED_PEER: &str = "aa11bb22cc33dd44ee55ff6600778899aabbccddeeff00112233445566778899";
+/// A peer no coin in this file declares -- the control that turns the assertion above into a
+/// binding rather than a decoration.
+const STRANGER_PEER: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// A chain that answers exactly what a test puts in it, and fails exactly where a test says.
 #[derive(Default)]
@@ -1194,6 +1201,9 @@ fn a_mirror_this_crate_creates_is_a_mirror_this_crate_discovers() {
 
     let spends = create(
         MirrorAdvertisement {
+            declared_peer: Some(
+                PeerDeclaration::from_hex(PUBLISHED_PEER).expect("a well-formed peer id"),
+            ),
             store_launcher_id: store_a(),
             root_hash: root_1(),
             epoch: epoch(),
@@ -1232,7 +1242,26 @@ fn a_mirror_this_crate_creates_is_a_mirror_this_crate_discovers() {
         1,
         "created mirror was not discoverable"
     );
-    assert_eq!(found.claims()[0].urls(), ["https://published.example"]);
+    // The declaration survives create -> chain -> discover, so the term the writer emits is the term
+    // the reader reads off a real coin. Without this the accessor could be perfectly correct about a
+    // format nothing in the ecosystem ever produces, which is satisfied vacuously rather than
+    // satisfied. The stranger control is what makes it a binding rather than a decoration.
+    assert!(
+        found.claims()[0].declares_peer(PUBLISHED_PEER),
+        "create must write a declaration that discover reads back"
+    );
+    assert!(
+        !found.claims()[0].declares_peer(STRANGER_PEER),
+        "and the coin must name only the peer its owner declared"
+    );
+    assert_eq!(
+        found.claims()[0].urls(),
+        [
+            "https://published.example".to_string(),
+            format!("dig-peer:{PUBLISHED_PEER}"),
+        ],
+        "the declaration rides behind the advertised URLs, not in front of them"
+    );
     assert_eq!(found.claims()[0].collateral(), COLLATERAL);
     assert_eq!(found.claims()[0].owner_puzzle_hash(), owner.puzzle_hash);
 
