@@ -24,6 +24,26 @@ use crate::namespace::mirror_hint;
 /// the advertisement — they belong together, and a caller who transposes two positional arguments in
 /// a money-moving call should not be able to. With `store_launcher_id` and `root_hash` sitting
 /// side by side and sharing a type, that stops being a style preference.
+///
+/// **Deliberately exhaustive — no `#[non_exhaustive]`, and every future field is therefore a major
+/// bump.** The attribute is carried by this crate's read-side types —
+/// [`MirrorError`](crate::MirrorError), [`SkipReason`](crate::SkipReason) and the census summary —
+/// because a consumer only ever *matches* on those. This one is an input: a
+/// consumer's only use for it is to construct it, and `#[non_exhaustive]` forbids struct-literal
+/// construction from outside the crate — so it cannot be added alone, and both shapes the required
+/// constructor could take are worse here than the literal:
+///
+/// - a positional `new` places `store_launcher_id` and `root_hash` adjacent, two `Bytes32`
+///   arguments a caller can transpose silently. That is the hazard the paragraph above says this
+///   type exists to remove, and transposing them advertises the wrong thing on a money path;
+/// - a builder whose `build()` reports a missing required field trades a compile-time completeness
+///   guarantee for a runtime `Result` on a spend path.
+///
+/// The compile error a new field causes is also the wanted behaviour for an advertisement rather
+/// than a cost to engineer away: it makes every consumer decide what the coin advertises instead of
+/// inheriting a default. This release is the demonstration — the break is what turned
+/// `declared_peer` into a deliberate decision at each call site, rather than a silently-`None` coin
+/// that locks collateral for an epoch and names no claimant to credit it to.
 #[derive(Debug, Clone)]
 pub struct MirrorAdvertisement {
     /// The store being advertised.
