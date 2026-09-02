@@ -82,6 +82,39 @@ fn two_declarations_name_nobody_rather_than_bonding_both_at_half_price() {
     assert!(!mirror.declares_peer(PEER_STRANGER));
 }
 
+/// §5.1 rule 3 counts declaration terms by PREFIX, not by successful parse, and this is the pair
+/// that can tell the two readings apart.
+///
+/// The test above uses two well-formed terms, so an implementation that occupies the slot only on a
+/// successful parse still returns `None` for it and passes — the fixture cannot exhibit the
+/// property. Here exactly one of the two terms parses. Counting by parse credits that one; counting
+/// by prefix declares nobody, which is what the rule requires: an owner must not be able to choose
+/// which of two declarations wins by writing the other one badly.
+///
+/// Both orders are asserted because a parse-counting implementation is order-sensitive — whether
+/// the malformed term arrives before or after the valid one decides whether the slot was already
+/// taken.
+#[test]
+fn a_valid_declaration_beside_a_malformed_one_names_nobody_in_either_order() {
+    let malformed = term("deadbeef");
+
+    let valid_first = coin_advertising(&["https://h.example", &term(PEER_H), &malformed]);
+    assert_eq!(
+        valid_first.declared_peer(),
+        None,
+        "a second prefixed term must void the first even when only the first parses"
+    );
+    assert!(!valid_first.declares_peer(PEER_H));
+
+    let malformed_first = coin_advertising(&["https://h.example", &malformed, &term(PEER_H)]);
+    assert_eq!(
+        malformed_first.declared_peer(),
+        None,
+        "an unparseable prefixed term must still occupy the slot"
+    );
+    assert!(!malformed_first.declares_peer(PEER_H));
+}
+
 /// Two spellings of one peer id denote the same SHA-256. Comparing the text rather than the bytes
 /// would withhold credit from an owner who wrote the id in the other case -- a silent authorization
 /// difference produced by nothing but capitalisation.

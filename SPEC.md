@@ -130,7 +130,11 @@ From that execution an implementation MUST take:
   The prefix has fixed arity. Entries 0, 1 and 2 MUST each be exactly 32 bytes; entry 3 is the epoch
   as a minimal signed big-endian integer, where an empty atom denotes zero. Every remaining entry is
   a URL, EXCEPT an optional trailing peer declaration (§5.1), which a writer MUST place after the
-  URLs and which a reader MUST NOT treat as a URL. An implementation MUST reject as not-mirror-shaped
+  URLs and which a reader MUST NOT treat as a URL. An entry after the fixed prefix that is **not
+  valid UTF-8** is not an advertised term: an implementation MUST drop it rather than surface it,
+  because the tail is the owner's free space and such an entry is arbitrary bytes that denote no
+  location. The advertised terms are the entries that remain, and §5.1's count of declaration terms
+  is taken over those. An implementation MUST reject as not-mirror-shaped
   any memo list shorter than five entries
   or whose fixed-width entries are the wrong width — a heterogeneous prefix read positionally without
   shape checks is how the ancestor layout `[hint, peerIp, publicSyntheticKey]` surfaced a public key
@@ -203,20 +207,20 @@ A conforming implementation:
    decoded count and requires implementations to do the same rather than leaving the two readings to
    diverge silently.
 
-8. MUST NOT allow a declaration to be written other than as a declaration. A writer that also accepts
+4. MUST NOT allow a declaration to be written other than as a declaration. A writer that also accepts
    a free list of advertised URLs MUST refuse a URL carrying the declaration prefix, because both are
    written into the same memo tail: without that refusal an at-most-one guarantee expressed in the
    writer's type is not a guarantee at all. A coin whose only advertised term is a declaration
    satisfies §5's arity rule while naming nowhere to fetch from; that is a badly-formed advertisement
    its own owner paid for, and a consumer MUST treat it as it treats any other tail entry that is not
    a reachable location.
-4. MUST treat a term whose payload is not exactly 64 hex characters as declaring nobody, and MUST
+5. MUST treat a term whose payload is not exactly 64 hex characters as declaring nobody, and MUST
    NOT fail on it. A peer id is a `SHA-256` output and has exactly one length.
-5. MUST NOT panic on any claimant string. A claimant id arrives from a provider record written by a
+6. MUST NOT panic on any claimant string. A claimant id arrives from a provider record written by a
    stranger, so it may be any bytes at all — including a 64-BYTE string that is not 64 characters.
-6. MUST place the declaration AFTER the advertised URLs in the memo tail, so adding one does not
+7. MUST place the declaration AFTER the advertised URLs in the memo tail, so adding one does not
    displace the first URL for a consumer reading the list positionally.
-7. MUST NOT treat the absence of a declaration as evidence of anything. Every coin created before
+8. MUST NOT treat the absence of a declaration as evidence of anything. Every coin created before
    this format existed carries none.
 
 **What the declaration establishes, and what it does not.** It binds a **coin to a peer id**. It
@@ -581,8 +585,8 @@ An implementation conforms when:
     position (§5.1 rule 3);
 27. a declaration is read identically whichever hex case its owner wrote it in (§5.1 rule 2), and a
     claimant id of 64 bytes that is not 64 characters is refused rather than panicked on (§5.1
-    rule 5);
+    rule 6);
 28. its `create` writes a declaration that its own reader reads back off a real coin, so the format
     the writer emits and the format the reader parses cannot diverge unnoticed (§5.1, §6.1).
 29. its `create` refuses an advertised URL carrying the declaration prefix, so the typed declaration
-    field is the only way a declaration is written (§5.1 rule 8).
+    field is the only way a declaration is written (§5.1 rule 4).
