@@ -362,10 +362,19 @@ pub fn census_height_seeded<S: ChainSource>(
     // height — but only on average, and the shape of the data comes from an untrusted source. So a
     // probe that fails to shrink the bracket meaningfully forces the next one to bisect, which
     // restores the geometric guarantee without paying for it when interpolation is working.
-    let mut force_bisection = false;
+    //
+    // "Meaningfully" is measured over several probes rather than one. A single interpolated probe
+    // that lands just below the answer leaves the bracket almost as wide as it was — `high` is still
+    // the peak — while being an excellent guess that the next probe builds on. Forcing a bisection
+    // there throws that guess away and probes the middle of the chain instead. So the guard only
+    // fires after a run of probes has failed to make headway, which on chain-shaped data never
+    // happens and on hostile data cannot be delayed indefinitely.
+    const STALLS_BEFORE_BISECTION: u32 = 3;
+
+    let mut stalls = 0u32;
     while low < high {
         let width = u64::from(high - low);
-        let probe = if force_bisection {
+        let probe = if stalls >= STALLS_BEFORE_BISECTION {
             // `low + (high - low) / 2` rather than `(low + high) / 2`: the operands are heights read
             // from a source, and their sum leaves `u32` well inside the range this loop must handle.
             low + (high - low) / 2
@@ -385,7 +394,11 @@ pub fn census_height_seeded<S: ChainSource>(
             None => low = probe + 1,
         }
 
-        force_bisection = !force_bisection && u64::from(high - low) * 4 > width * 3;
+        stalls = if u64::from(high - low) * 4 > width * 3 {
+            stalls + 1
+        } else {
+            0
+        };
     }
 
     // `low` satisfies the predicate and is minimal, so it IS the witnessing transaction block.
