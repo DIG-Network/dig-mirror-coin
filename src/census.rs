@@ -315,8 +315,12 @@ pub fn census_height<S: ChainSource>(
 /// So the seed is checked against the source before it is used: the seed height's own timestamp is
 /// read and must be **strictly below** the epoch start. An honest seed is the previous epoch's
 /// census height, whose timestamp lies a whole epoch below this instant, so it passes with an
-/// enormous margin; an inflated one cannot. A seed that fails, or that exceeds the peak, is
-/// discarded and the full `[0, peak]` search runs — one wasted read, and the shipped behaviour.
+/// enormous margin; an inflated one cannot. A seed that fails, or that is not strictly below the
+/// peak — a seed at the peak bounds nothing, since the answer already lies at or below it — is
+/// discarded and the full `[0, peak]` search runs. That fallback is the interpolated `[0, peak]`
+/// search this function performs unseeded — the same height, reached by different work, not the
+/// shipped bisection. A readable seed that is rejected costs one wasted read; a seed whose
+/// neighbourhood the source cannot answer for at all costs the walk-down bound, up to 65.
 /// **A bad seed costs work, never correctness.**
 ///
 /// The seed is a bare height rather than a [`CensusHeight`] for the same reason: with no
@@ -345,7 +349,10 @@ pub fn census_height_seeded<S: ChainSource>(
     let mut above = above;
     let mut below: Option<(u32, u64)> = None;
 
-    if let Some(seed) = seed_height.filter(|seed| *seed <= peak) {
+    // Strictly below the peak, not merely at or below it. A seed *equal* to the peak cannot bound
+    // anything — the answer already lies at or below the peak — and accepting one is the single way
+    // the bracket can break, because it is the only seed for which `seed + 1` exceeds `high`.
+    if let Some(seed) = seed_height.filter(|seed| *seed < peak) {
         // Read the seed's timestamp rather than trusting the caller's claim about it. A seed whose
         // block is at or after the epoch start does not bound the answer from below and is dropped.
         // The seed is a *hint*, so every way it can fail to answer is the same failure: the hint
@@ -359,9 +366,14 @@ pub fn census_height_seeded<S: ChainSource>(
             .flatten()
             .filter(|(_, t)| *t < epoch_start_unix_secs)
         {
-            // The predicate is false at `seed` and true at `peak`, so `seed < peak` and this cannot
-            // overflow or exceed `high`.
-            low = seed + 1;
+            // `seed < peak == high` was enforced above, so this is within `high` and cannot
+            // overflow. That is stated as an enforced fact rather than inferred from the two
+            // timestamp reads: inferring it needs the source to answer both reads from the same
+            // chain view, and a pooled multi-peer source can answer two reads of the same height
+            // from two different peers. The saturating add and the clamp cost nothing on every
+            // consistent path and keep `low <= high` a property of this code rather than of the
+            // source, so a later reader can trust the loop bound below without re-deriving it.
+            low = seed.saturating_add(1).min(high);
             below = Some((witness, timestamp));
         }
     }
@@ -454,10 +466,10 @@ fn interpolated_probe(
     // keeps a source that violates it from steering the estimate out of the bracket.
     let offset = target.saturating_sub(below_timestamp).min(seconds);
 
-    // Saturating rather than wrapping: `heights` and `offset` are derived from an untrusted
-    // source, and their product can exceed `u64` on absurd inputs. A release build clamps and a
-    // debug build panics, so the arithmetic is made explicit. The clamp below keeps any saturated
-    // estimate inside the bracket, so the answer is unchanged either way.
+    // Saturating rather than plain arithmetic: `heights` and `offset` are derived from an
+    // untrusted source, and their product can exceed `u64` on absurd inputs. Plain `*` would panic
+    // in a debug build and wrap in a release one; saturating clamps identically in both, and the
+    // clamp below keeps any saturated estimate inside the bracket, so the answer is unchanged.
     let estimate = u64::from(below_height).saturating_add(heights.saturating_mul(offset) / seconds);
     estimate.clamp(u64::from(low), u64::from(high - 1)) as u32
 }

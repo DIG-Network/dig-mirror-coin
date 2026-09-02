@@ -317,9 +317,14 @@ A hint is **untrusted input**. An implementation MUST verify a hint against the 
 relying on it, and MUST discard any hint it cannot verify rather than trusting it. Specifically, an
 implementation MUST read the hinted height's own timestamp from the source and MUST use the hint as
 a lower bound only where that timestamp is **strictly before the epoch start** — the condition that
-establishes the hint is genuinely below `H(n)`. A hint above the peak, a hint the source cannot
-answer for, and a hint whose block is at or after the epoch start MUST all be discarded, and the
-unhinted search MUST then run. An implementation MUST NOT take a hint's own account of its
+establishes the hint is genuinely below `H(n)`. A hint **at or above the peak**, a hint the source
+cannot answer for, and a hint whose block is at or after the epoch start MUST all be discarded, and
+the unhinted search MUST then run. A hint at the peak bounds nothing, since `H(n)` already lies at
+or below the peak; and because a source is not required to answer two reads of the same height
+consistently, an implementation that accepted one could raise its lower bound above the peak, skip
+its search entirely and return the peak block. An implementation MUST NOT let the bound it derives
+from a hint exceed the peak, and MUST NOT rely on the source answering consistently to guarantee
+that. An implementation MUST NOT take a hint's own account of its
 timestamp as evidence about the chain.
 
 **Choosing which height to probe is not inventing a timestamp.** The rule above that an
