@@ -140,7 +140,9 @@ impl ChainSource for GeneratedChain {
 fn epoch_starts(chain: &GeneratedChain, count: u32) -> Vec<u64> {
     let span = chain.peak_timestamp() - GENESIS;
     let epoch = span / u64::from(count + 1);
-    (1..=count).map(|n| GENESIS + epoch * u64::from(n)).collect()
+    (1..=count)
+        .map(|n| GENESIS + epoch * u64::from(n))
+        .collect()
 }
 
 /// The shapes worth covering: dense and sparse transaction blocks, fast and slow chains.
@@ -350,6 +352,9 @@ fn a_future_epoch_answers_none_with_a_seed_as_without_one() {
         .unwrap()
         .map(|found| found.height);
 
-    assert_eq!(census_height_seeded(&chain, future, seed).expect("answers"), None);
+    assert_eq!(
+        census_height_seeded(&chain, future, seed).expect("answers"),
+        None
+    );
     assert_eq!(census_height(&chain, future).expect("answers"), None);
 }
