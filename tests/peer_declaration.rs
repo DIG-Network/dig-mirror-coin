@@ -172,6 +172,10 @@ fn bonding_the_content_and_naming_the_claimant_are_separate_answers() {
         "the coin really does bond this content"
     );
     assert!(
+        mirror.declares_peer(PEER_H),
+        "and it names its own peer -- asserted so this test varies with the parser"
+    );
+    assert!(
         !mirror.declares_peer(PEER_STRANGER),
         "and it still names only the peer its owner declared"
     );

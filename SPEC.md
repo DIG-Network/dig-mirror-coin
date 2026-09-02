@@ -124,19 +124,22 @@ From that execution an implementation MUST take:
   in this layout:
 
   ```
-  [ hint(32) , store(32) , root(32) , epoch(signed big-endian) , url , url , … ]
+  [ hint(32) , store(32) , root(32) , epoch(signed big-endian) , url , url , … , dig-peer:… ? ]
   ```
 
   The prefix has fixed arity. Entries 0, 1 and 2 MUST each be exactly 32 bytes; entry 3 is the epoch
   as a minimal signed big-endian integer, where an empty atom denotes zero. Every remaining entry is
-  a URL. An implementation MUST reject as not-mirror-shaped any memo list shorter than five entries
+  a URL, EXCEPT an optional trailing peer declaration (§5.1), which a writer MUST place after the
+  URLs and which a reader MUST NOT treat as a URL. An implementation MUST reject as not-mirror-shaped
+  any memo list shorter than five entries
   or whose fixed-width entries are the wrong width — a heterogeneous prefix read positionally without
   shape checks is how the ancestor layout `[hint, peerIp, publicSyntheticKey]` surfaced a public key
   as a URL.
 
-  The declared advertisement is the ONE property taken from the memos, and §4.1 states why: whoever
-  locks the collateral chooses what to stake it on, so the declaration is theirs to make and a
-  consumer's obligation is to compare it against what it asked about rather than to assume it.
+  The declared advertisement is one of exactly TWO properties taken from the memos — the other is the
+  optional peer declaration of §5.1 — and §4.1 states why this one is: whoever locks the collateral
+  chooses what to stake it on, so the declaration is theirs to make and a consumer's obligation is to
+  compare it against what it asked about rather than to assume it.
 
 A coin whose creating spend cannot be read MUST NOT be accepted.
 
@@ -164,8 +167,13 @@ and §6.2 requires that owner to remain available rather than be discarded with 
 ### 5.1 The peer declaration
 
 A mirror coin MAY declare the **DIG peer** its collateral stands behind. The declaration is an
-advertised memo term of the exact form `dig-peer:<64 lowercase hex characters>`, naming a
-`peer_id` as defined by the DIG peer network (`SHA-256` of the TLS SubjectPublicKeyInfo DER).
+advertised memo term of the form `dig-peer:<64 hexadecimal characters>`, naming a `peer_id` as
+defined by the DIG peer network (`SHA-256` of the TLS SubjectPublicKeyInfo DER).
+
+**A writer MUST emit lowercase; a reader MUST accept either case.** The two halves are stated
+together because splitting them is an authorization difference: a reimplementation that read only the
+writer's half would refuse `dig-peer:AA11…` while this crate credits it, and the peers whose owners
+happened to write uppercase would be bonded by one implementation and not the other.
 
 Every other statement in §5 says a memo MUST NOT be believed. This one is different, and the
 difference is precise: a memo cannot establish **who owns** a coin, because anyone may write any

@@ -167,7 +167,14 @@ impl MirrorCoin {
                 )
     }
 
-    /// The URLs the owner advertises for the store, in the order they were published.
+    /// The advertised memo tail, in the order it was published.
+    ///
+    /// Ordinarily these are the URLs the owner advertises for the store, but the tail is the owner's
+    /// free space and this method returns ALL of it: a coin may end with a `dig-peer:` peer
+    /// declaration (§5.1), which is not a URL and which
+    /// [`declared_peer`](Self::declared_peer) reads from this same list. A caller iterating these as
+    /// fetch locations should expect that entry and ignore it, exactly as it must already tolerate
+    /// any other string an owner chose to write.
     ///
     /// Unverified strings straight off the chain. Treat them as untrusted input: they have not been
     /// contacted, parsed for scheme, or bounded in number by anything but the block that carried
