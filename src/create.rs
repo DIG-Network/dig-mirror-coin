@@ -14,6 +14,7 @@ use indexmap::indexmap;
 use num_bigint::BigInt;
 
 use crate::asset::{mirror_coin_inner_puzzle_hash, DIG_ASSET_ID};
+use crate::declaration::PeerDeclaration;
 use crate::error::MirrorError;
 use crate::namespace::mirror_hint;
 
@@ -37,6 +38,17 @@ pub struct MirrorAdvertisement {
     pub epoch: BigInt,
     /// Where the store can be fetched from. MUST be non-empty.
     pub urls: Vec<String>,
+    /// The DIG peer this collateral stands behind, if any.
+    ///
+    /// An `Option` rather than a list, deliberately: the collateral is what makes a claim cost
+    /// something, and one coin standing behind several peers would make each of those claims cost a
+    /// fraction as much while every one still read as fully bonded. `Option` cannot represent two,
+    /// so that dilution is not expressible here rather than merely discouraged. An owner who wants
+    /// two peers bonded creates two coins and locks the collateral twice.
+    ///
+    /// `None` writes no declaration, which is exactly what every coin created before this format
+    /// existed carries — such a coin bonds content but names no claimant.
+    pub declared_peer: Option<PeerDeclaration>,
     /// The $DIG locked behind the claim, in **DIG CAT base units** (`1 DIG = 1_000`, never
     /// mojos — see [`MirrorCoin::collateral`](crate::MirrorCoin::collateral)). MUST be non-zero.
     pub collateral: u64,
@@ -66,6 +78,7 @@ pub fn create(
     fee: u64,
 ) -> Result<Vec<CoinSpend>, MirrorError> {
     let MirrorAdvertisement {
+        declared_peer,
         store_launcher_id,
         root_hash,
         epoch,
@@ -95,7 +108,7 @@ pub fn create(
     let owner = StandardLayer::new(synthetic_key);
     let owner_puzzle_hash: Bytes32 = owner.tree_hash().into();
 
-    // `[hint, store, root, epoch, url…]` — the layout `parse_memos` reads back. The coin DECLARES
+    // `[hint, store, root, epoch, url…, dig-peer:…]` — the layout `parse_memos` reads back. The coin DECLARES
     // what it bonds, because a hint cannot: see `MirrorCoin::advertises`.
     let namespace_hint = mirror_hint(store_launcher_id, root_hash, owner_puzzle_hash, &epoch);
     let mut memo_entries = Vec::with_capacity(urls.len() + 4);
@@ -105,6 +118,12 @@ pub fn create(
     memo_entries.push(Bytes::new(epoch.to_signed_bytes_be()));
     for url in &urls {
         memo_entries.push(Bytes::new(url.as_bytes().to_vec()));
+    }
+    // Appended AFTER the advertised URLs rather than before them. `MirrorCoin::urls` hands the whole
+    // tail back, so a declaration written first would land at `urls()[0]` and displace the first
+    // real URL for every consumer that reads the list positionally.
+    if let Some(declaration) = &declared_peer {
+        memo_entries.push(Bytes::new(declaration.to_term().into_bytes()));
     }
 
     let memos = Memos::Some(ctx.alloc(&memo_entries)?);
@@ -147,6 +166,7 @@ mod tests {
     fn creation_without_urls_is_refused() {
         let error = create(
             MirrorAdvertisement {
+                declared_peer: None,
                 store_launcher_id: Bytes32::new([1u8; 32]),
                 root_hash: Bytes32::new([2u8; 32]),
                 epoch: BigInt::from(0),
@@ -169,6 +189,7 @@ mod tests {
     fn creation_without_collateral_is_refused() {
         let error = create(
             MirrorAdvertisement {
+                declared_peer: None,
                 store_launcher_id: Bytes32::new([1u8; 32]),
                 root_hash: Bytes32::new([2u8; 32]),
                 epoch: BigInt::from(0),

@@ -161,6 +161,46 @@ An implementation MUST also carry forward what was established BEFORE the memos 
 chosen by whoever spent the parent. A coin with undecodable memos therefore still has a known owner,
 and §6.2 requires that owner to remain available rather than be discarded with the memo failure.
 
+### 5.1 The peer declaration
+
+A mirror coin MAY declare the **DIG peer** its collateral stands behind. The declaration is an
+advertised memo term of the exact form `dig-peer:<64 lowercase hex characters>`, naming a
+`peer_id` as defined by the DIG peer network (`SHA-256` of the TLS SubjectPublicKeyInfo DER).
+
+Every other statement in §5 says a memo MUST NOT be believed. This one is different, and the
+difference is precise: a memo cannot establish **who owns** a coin, because anyone may write any
+bytes into their own coin's memos — but it does establish **what the owner said**, because the memos
+are written by the spend that creates the coin and only the owner's key can produce that spend. The
+declaration is therefore an owner attestation carried by executed on-chain code, and it is the only
+memo-derived value in this specification that an implementation MAY rely on against an adversary.
+
+A conforming implementation:
+
+1. MUST match the prefix `dig-peer:` exactly. `DIG-PEER:`, `dig-peers:` and `xdig-peer:` are
+   ordinary advertised strings.
+2. MUST compare peer ids as the 32 BYTES they denote, never as text. One peer id has two hex
+   spellings, and treating them as different peers withholds credit on capitalisation alone.
+3. MUST treat a coin carrying **two or more** terms with the declaration prefix as declaring
+   **nobody**, whether or not each parses. This is an economic rule, not a parsing convenience: the
+   collateral is what makes a claim cost something, so one coin standing behind several peers would
+   make each claim cost a fraction as much while every one still read as fully bonded. An owner who
+   wants two peers bonded MUST create two coins and lock the collateral twice.
+4. MUST treat a term whose payload is not exactly 64 hex characters as declaring nobody, and MUST
+   NOT fail on it. A peer id is a `SHA-256` output and has exactly one length.
+5. MUST NOT panic on any claimant string. A claimant id arrives from a provider record written by a
+   stranger, so it may be any bytes at all — including a 64-BYTE string that is not 64 characters.
+6. MUST place the declaration AFTER the advertised URLs in the memo tail, so adding one does not
+   displace the first URL for a consumer reading the list positionally.
+7. MUST NOT treat the absence of a declaration as evidence of anything. Every coin created before
+   this format existed carries none.
+
+**What the declaration establishes, and what it does not.** It binds a **coin to a peer id**. It
+does not bind a peer id to a network address, and an implementation MUST NOT read it as if it did: a
+provider record carrying an honest holder's peer id, that holder's real coin id, and an attacker's
+addresses satisfies this check completely. Closing that requires the consumer's transport to pin the
+dialled peer id against the presented certificate, which is a property of the transport and not of
+this crate. A consumer whose transport does not pin MUST NOT use a declaration to rank a holder.
+
 ## 6. The verbs
 
 ### 6.1 create
@@ -510,3 +550,12 @@ An implementation conforms when:
     §8.7);
 24. its census ends, rather than excluding the coin and completing, when a source answers a
     candidate's creating-spend read with a different coin's genuine spend (§8.7).
+25. a coin declares the peer its owner named and refuses every other claimant asking about that same
+    coin, and the same coin without a declaration term names nobody (§5.1);
+26. a coin carrying two declaration terms declares NEITHER of them, rather than the first by
+    position (§5.1 rule 3);
+27. a declaration is read identically whichever hex case its owner wrote it in (§5.1 rule 2), and a
+    claimant id of 64 bytes that is not 64 characters is refused rather than panicked on (§5.1
+    rule 5);
+28. its `create` writes a declaration that its own reader reads back off a real coin, so the format
+    the writer emits and the format the reader parses cannot diverge unnoticed (§5.1, §6.1).
