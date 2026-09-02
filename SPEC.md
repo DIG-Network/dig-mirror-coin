@@ -193,6 +193,23 @@ A conforming implementation:
    collateral is what makes a claim cost something, so one coin standing behind several peers would
    make each claim cost a fraction as much while every one still read as fully bonded. An owner who
    wants two peers bonded MUST create two coins and lock the collateral twice.
+
+   **The count is over the UTF-8-decodable terms**, which are the ones §5 already keeps: a memo entry
+   that is not valid UTF-8 is not an advertised term and is dropped before this rule applies. The
+   scoping is stated because it is observable — an owner may publish a tail whose raw bytes carry two
+   prefixed entries of which only one decodes, and a reader counting raw entries would credit nobody
+   where a reader counting terms credits the one that decoded. Only that coin's own owner can create
+   the situation, and the stricter reading merely withholds credit, so this specification takes the
+   decoded count and requires implementations to do the same rather than leaving the two readings to
+   diverge silently.
+
+8. MUST NOT allow a declaration to be written other than as a declaration. A writer that also accepts
+   a free list of advertised URLs MUST refuse a URL carrying the declaration prefix, because both are
+   written into the same memo tail: without that refusal an at-most-one guarantee expressed in the
+   writer's type is not a guarantee at all. A coin whose only advertised term is a declaration
+   satisfies §5's arity rule while naming nowhere to fetch from; that is a badly-formed advertisement
+   its own owner paid for, and a consumer MUST treat it as it treats any other tail entry that is not
+   a reachable location.
 4. MUST treat a term whose payload is not exactly 64 hex characters as declaring nobody, and MUST
    NOT fail on it. A peer id is a `SHA-256` output and has exactly one length.
 5. MUST NOT panic on any claimant string. A claimant id arrives from a provider record written by a
@@ -567,3 +584,5 @@ An implementation conforms when:
     rule 5);
 28. its `create` writes a declaration that its own reader reads back off a real coin, so the format
     the writer emits and the format the reader parses cannot diverge unnoticed (§5.1, §6.1).
+29. its `create` refuses an advertised URL carrying the declaration prefix, so the typed declaration
+    field is the only way a declaration is written (§5.1 rule 8).

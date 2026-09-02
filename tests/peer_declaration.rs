@@ -12,7 +12,10 @@
 //! declared peer passes identically whether the binding works or is missing entirely, so each test
 //! below asks about a peer the coin did **not** name and asserts the answer is no.
 
-use dig_mirror_coin::{declared_peer, MirrorCoin, PeerDeclaration, PEER_DECLARATION_PREFIX};
+use dig_mirror_coin::{
+    create, declared_peer, MirrorAdvertisement, MirrorCoin, MirrorError, PeerDeclaration,
+    PEER_DECLARATION_PREFIX,
+};
 
 mod support;
 
@@ -212,6 +215,68 @@ fn the_written_term_is_the_term_that_is_read() {
         declared_peer(&[declaration.to_term()]),
         Some(declaration),
         "the reader must read back exactly what the writer emits"
+    );
+}
+
+/// `create` refuses a declaration smuggled in as an advertised URL.
+///
+/// The typed `declared_peer` field is what makes "one coin declares at most one peer" a property of
+/// the type rather than a comment. Both it and `urls` are written verbatim into the same memo tail,
+/// so without this refusal a caller could write a declaration -- or a second one -- without ever
+/// touching the field, and the guarantee would be worth nothing. Refused rather than filtered: a
+/// caller that passed one meant something by it.
+///
+/// The advertisement is otherwise well formed and the funding list is empty, so the guard is the
+/// only thing that can produce this error; the honest control below proves the same call shape
+/// reaches past it.
+#[test]
+fn create_refuses_a_declaration_smuggled_in_as_an_advertised_url() {
+    let owner = wallet(4);
+
+    let smuggled = create(
+        MirrorAdvertisement {
+            declared_peer: None,
+            store_launcher_id: store_a(),
+            root_hash: root_1(),
+            epoch: epoch(),
+            urls: vec!["https://h.example".to_string(), term(PEER_H)],
+            collateral: 1_000,
+        },
+        Vec::new(),
+        owner.public_key,
+        Vec::new(),
+        0,
+    );
+
+    match smuggled {
+        Err(MirrorError::Malformed(message)) => assert!(
+            message.contains("declared_peer"),
+            "the refusal must name the field to use instead; got {message:?}"
+        ),
+        other => panic!("a smuggled declaration must be refused, got {other:?}"),
+    }
+
+    // Control: the identical call without the smuggled term gets PAST this guard. It still fails --
+    // there are no coins to fund it -- but it fails for a different reason, which is what says the
+    // assertion above measured the guard rather than the empty funding list.
+    let honest = create(
+        MirrorAdvertisement {
+            declared_peer: Some(PeerDeclaration::from_hex(PEER_H).expect("well formed")),
+            store_launcher_id: store_a(),
+            root_hash: root_1(),
+            epoch: epoch(),
+            urls: vec!["https://h.example".to_string()],
+            collateral: 1_000,
+        },
+        Vec::new(),
+        owner.public_key,
+        Vec::new(),
+        0,
+    );
+
+    assert!(
+        !matches!(&honest, Err(MirrorError::Malformed(message)) if message.contains("declared_peer")),
+        "the honest advertisement must not trip the smuggling guard"
     );
 }
 

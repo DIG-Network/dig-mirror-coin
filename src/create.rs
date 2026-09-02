@@ -14,7 +14,7 @@ use indexmap::indexmap;
 use num_bigint::BigInt;
 
 use crate::asset::{mirror_coin_inner_puzzle_hash, DIG_ASSET_ID};
-use crate::declaration::PeerDeclaration;
+use crate::declaration::{PeerDeclaration, PEER_DECLARATION_PREFIX};
 use crate::error::MirrorError;
 use crate::namespace::mirror_hint;
 
@@ -43,8 +43,12 @@ pub struct MirrorAdvertisement {
     /// An `Option` rather than a list, deliberately: the collateral is what makes a claim cost
     /// something, and one coin standing behind several peers would make each of those claims cost a
     /// fraction as much while every one still read as fully bonded. `Option` cannot represent two,
-    /// so that dilution is not expressible here rather than merely discouraged. An owner who wants
-    /// two peers bonded creates two coins and locks the collateral twice.
+    /// so that dilution is not expressible here.
+    ///
+    /// This field is the ONLY way to write a declaration through this crate, and [`create`] enforces
+    /// that by refusing a `urls` entry carrying the declaration prefix — the two write into the same
+    /// memo tail, so without that refusal the type would guarantee nothing. An owner who wants two
+    /// peers bonded creates two coins and locks the collateral twice.
     ///
     /// `None` writes no declaration, which is exactly what every coin created before this format
     /// existed carries — such a coin bonds content but names no claimant.
@@ -99,6 +103,21 @@ pub fn create(
         return Err(MirrorError::Malformed(
             "a mirror must lock a non-zero amount of $DIG as collateral".to_string(),
         ));
+    }
+
+    // The declaration is a TYPED field, and this is what makes that mean something. `urls` entries
+    // are written into the same memo tail verbatim, so without this check a caller could smuggle a
+    // declaration past `declared_peer` by spelling one as a URL -- and the type-level guarantee that
+    // one coin declares at most one peer would be a comment rather than a property. Refused rather
+    // than filtered: a caller that passed one meant something by it, and silently dropping the entry
+    // would publish an advertisement it did not ask for.
+    if let Some(smuggled) = urls
+        .iter()
+        .find(|url| url.starts_with(PEER_DECLARATION_PREFIX))
+    {
+        return Err(MirrorError::Malformed(format!(
+            "an advertised URL must not carry the peer-declaration prefix; use `declared_peer` instead (got {smuggled:?})"
+        )));
     }
 
     let mut ctx = SpendContext::new();

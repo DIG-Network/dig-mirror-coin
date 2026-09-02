@@ -33,10 +33,18 @@
 //! locks the collateral twice, which is the price the design intends.
 //!
 //! Both ends hold this. [`MirrorAdvertisement::declared_peer`](crate::MirrorAdvertisement) is an
-//! `Option`, which cannot represent two, so a writer using this crate is structurally unable to
-//! dilute. A coin that nonetheless carries two or more declaration terms — which only its own owner
-//! could have written — declares **nobody**: an ambiguous coin withholds credit rather than
-//! granting it to a guess.
+//! `Option`, which cannot represent two, and [`create`](crate::create) refuses an advertised URL
+//! carrying the declaration prefix — the two write into the same memo tail, so the typed field is a
+//! guarantee only because the untyped path beside it is closed. A coin that nonetheless carries two
+//! or more declaration terms — which only its own owner could have written — declares **nobody**: an
+//! ambiguous coin withholds credit rather than granting it to a guess.
+//!
+//! **The count is over the terms this crate can READ**, which are the UTF-8-decodable ones: a memo
+//! entry that is not valid UTF-8 is dropped before it reaches here. An owner can therefore publish a
+//! tail whose raw bytes hold two prefixed entries where only one decodes, and this crate credits
+//! that one. The divergence is bounded and self-inflicted — only the coin's own owner can write such
+//! a tail, and the strictest reading credits nobody rather than someone else — but it is stated in
+//! `SPEC.md` §5.1 rather than left for two implementations to discover separately.
 
 use crate::MirrorError;
 
