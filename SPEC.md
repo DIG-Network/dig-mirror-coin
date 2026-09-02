@@ -371,6 +371,38 @@ report it as an empty answer.
 The epoch calendar — the mapping from an epoch number to its start time — is **not defined by this
 crate**. An implementation MUST take the epoch start as an input.
 
+#### 8.1.1 Search hints
+
+An implementation MAY accept a caller-supplied **lower bound** on `H(n)` as a hint — typically
+`H(n-1)`, which a caller walking successive epochs already holds.
+
+A hint constrains only **where an implementation looks**. It MUST NOT be able to change **which
+height is returned**: for every hint, valid or not, the height returned MUST equal the height the
+same implementation returns with no hint at all. An implementation that can return a different
+height because of a hint does not satisfy this section, because `H(n)` is consensus data and a hint
+is not.
+
+A hint is **untrusted input**. An implementation MUST verify a hint against the source before
+relying on it, and MUST discard any hint it cannot verify rather than trusting it. Specifically, an
+implementation MUST read the hinted height's own timestamp from the source and MUST use the hint as
+a lower bound only where that timestamp is **strictly before the epoch start** — the condition that
+establishes the hint is genuinely below `H(n)`. A hint **at or above the peak**, a hint the source
+cannot answer for, and a hint whose block is at or after the epoch start MUST all be discarded, and
+the unhinted search MUST then run. A hint at the peak bounds nothing, since `H(n)` already lies at
+or below the peak; and because a source is not required to answer two reads of the same height
+consistently, an implementation that accepted one could raise its lower bound above the peak, skip
+its search entirely and return the peak block. An implementation MUST NOT let the bound it derives
+from a hint exceed the peak, and MUST NOT rely on the source answering consistently to guarantee
+that. An implementation MUST NOT take a hint's own account of its
+timestamp as evidence about the chain.
+
+**Choosing which height to probe is not inventing a timestamp.** The rule above that an
+implementation MUST NOT interpolate a timestamp governs the *answer*: no height may be selected as
+`H(n)` on the strength of a timestamp that no block carries. It does not govern the *search*. An
+implementation MAY choose each height it probes by any means, interpolation between two observed
+timestamps included, because every timestamp it then compares is one the source answered for a real
+block. The two rules are about different acts and do not conflict.
+
 ### 8.2 Qualifying coins
 
 A coin at `H(n)` qualifies for the census of epoch `n` when all of the following hold.

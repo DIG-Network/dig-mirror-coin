@@ -288,6 +288,192 @@ pub fn census_height<S: ChainSource>(
     Ok(Some(CensusHeight { height, timestamp }))
 }
 
+/// As [`census_height`], with a caller-supplied lower bound to search from.
+///
+/// A caller walking every epoch since genesis already knows a height the answer must lie above: the
+/// census height of the epoch it just resolved. Passing it here confines the search to
+/// `[seed_height, peak]` and lets the first probe be *interpolated* from the two timestamps
+/// bracketing that range rather than taken from its midpoint. On a mainnet-shaped chain that turns a
+/// per-epoch cost of roughly forty-five reads, growing with chain height, into roughly ten that does
+/// not grow at all.
+///
+/// # The seed cannot change the answer, only the work
+///
+/// This returns exactly what [`census_height`] returns for the same `epoch_start_unix_secs`, for
+/// every seed, honest or not. That is the whole contract, and it is not a courtesy: the census
+/// height is a consensus value, so a search that returned a *different* height because of a hint
+/// would have the node deriving a collateral requirement no other node agrees with — the fork the
+/// module docs describe.
+///
+/// # The seed is untrusted, and is verified rather than believed
+///
+/// A seed can originate outside the node — dig-node's stored census height may be adopted from a
+/// sampled peer cohort, and its own guards bound that height only from below. A seed *above* the
+/// true census height is therefore reachable, and believing one would confine the search above the
+/// answer and return a plausible, wrong height.
+///
+/// So the seed is checked against the source before it is used: the seed height's own timestamp is
+/// read and must be **strictly below** the epoch start. An honest seed is the previous epoch's
+/// census height, whose timestamp lies a whole epoch below this instant, so it passes with an
+/// enormous margin; an inflated one cannot. A seed that fails, or that is not strictly below the
+/// peak — a seed at the peak bounds nothing, since the answer already lies at or below it — is
+/// discarded and the full `[0, peak]` search runs. That fallback is the interpolated `[0, peak]`
+/// search this function performs unseeded — the same height, reached by different work, not the
+/// shipped bisection. A readable seed that is rejected costs one wasted read; a seed whose
+/// neighbourhood the source cannot answer for at all costs the walk-down bound, up to 65.
+/// **A bad seed costs work, never correctness.**
+///
+/// The seed is a bare height rather than a [`CensusHeight`] for the same reason: with no
+/// caller-supplied timestamp to carry, there is no caller-supplied timestamp that could lie. The
+/// hazard is removed by construction instead of by a check a later reader could delete.
+pub fn census_height_seeded<S: ChainSource>(
+    source: &S,
+    epoch_start_unix_secs: u64,
+    seed_height: Option<u32>,
+) -> Result<Option<CensusHeight>, MirrorError> {
+    let peak = source.peak_height().map_err(unavailable)?.ok_or_else(|| {
+        MirrorError::ChainUnavailable("source exposes no peak height".to_string())
+    })?;
+
+    // The epoch has not begun on chain yet. Not an error: the ordinary state of a future epoch.
+    // The witness is kept rather than discarded — it is the upper anchor every interpolation below
+    // is drawn against, so the seeded search pays no read the unseeded one did not already pay.
+    let Some(above) = timestamp_at_or_below(source, peak)?
+        .filter(|(_, timestamp)| *timestamp >= epoch_start_unix_secs)
+    else {
+        return Ok(None);
+    };
+
+    let mut low = 0u32;
+    let mut high = peak;
+    let mut above = above;
+    let mut below: Option<(u32, u64)> = None;
+
+    // Strictly below the peak, not merely at or below it. A seed *equal* to the peak cannot bound
+    // anything — the answer already lies at or below the peak — and accepting one is the single way
+    // the bracket can break, because it is the only seed for which `seed + 1` exceeds `high`.
+    if let Some(seed) = seed_height.filter(|seed| *seed < peak) {
+        // Read the seed's timestamp rather than trusting the caller's claim about it. A seed whose
+        // block is at or after the epoch start does not bound the answer from below and is dropped.
+        // The seed is a *hint*, so every way it can fail to answer is the same failure: the hint
+        // is unusable and the unhinted search runs. `?` here would propagate the probe's
+        // `ChainUnavailable` — a transient read error, or a run of non-transaction blocks below the
+        // seed — and fail a search that succeeds without the seed, letting a bad hint change
+        // correctness rather than only work. Only this probe is swallowed; every other read below
+        // is a real search read whose failure must propagate.
+        if let Some((witness, timestamp)) = timestamp_at_or_below(source, seed)
+            .ok()
+            .flatten()
+            .filter(|(_, t)| *t < epoch_start_unix_secs)
+        {
+            // `seed < peak == high` was enforced above, so this is within `high` and cannot
+            // overflow. That is stated as an enforced fact rather than inferred from the two
+            // timestamp reads: inferring it needs the source to answer both reads from the same
+            // chain view, and a pooled multi-peer source can answer two reads of the same height
+            // from two different peers. The saturating add and the clamp cost nothing on every
+            // consistent path and keep `low <= high` a property of this code rather than of the
+            // source, so a later reader can trust the loop bound below without re-deriving it.
+            low = seed.saturating_add(1).min(high);
+            below = Some((witness, timestamp));
+        }
+    }
+
+    // Interpolation is dramatically better than bisection on timestamps, which are near-linear in
+    // height — but only on average, and the shape of the data comes from an untrusted source. So a
+    // probe that fails to shrink the bracket meaningfully forces the next one to bisect, which
+    // restores the geometric guarantee without paying for it when interpolation is working.
+    //
+    // "Meaningfully" is measured over several probes rather than one. A single interpolated probe
+    // that lands just below the answer leaves the bracket almost as wide as it was — `high` is still
+    // the peak — while being an excellent guess that the next probe builds on. Forcing a bisection
+    // there throws that guess away and probes the middle of the chain instead. So the guard only
+    // fires after a run of probes has failed to make headway, which on chain-shaped data never
+    // happens and on hostile data cannot be delayed indefinitely.
+    const STALLS_BEFORE_BISECTION: u32 = 3;
+
+    let mut stalls = 0u32;
+    while low < high {
+        let width = u64::from(high - low);
+        let probe = if stalls >= STALLS_BEFORE_BISECTION {
+            // `low + (high - low) / 2` rather than `(low + high) / 2`: the operands are heights read
+            // from a source, and their sum leaves `u32` well inside the range this loop must handle.
+            low + (high - low) / 2
+        } else {
+            interpolated_probe(low, high, below, above, epoch_start_unix_secs)
+        };
+
+        match timestamp_at_or_below(source, probe)? {
+            Some((witness, timestamp)) if timestamp >= epoch_start_unix_secs => {
+                high = probe;
+                above = (witness, timestamp);
+            }
+            Some(witnessed) => {
+                low = probe + 1;
+                below = Some(witnessed);
+            }
+            None => low = probe + 1,
+        }
+
+        stalls = if u64::from(high - low) * 4 > width * 3 {
+            stalls + 1
+        } else {
+            0
+        };
+    }
+
+    // `low` satisfies the predicate and is minimal, so it IS the witnessing transaction block.
+    let (height, timestamp) = timestamp_at_or_below(source, low)?.ok_or_else(|| {
+        MirrorError::ChainUnavailable(
+            "timestamps changed under the search; census height not established".to_string(),
+        )
+    })?;
+
+    Ok(Some(CensusHeight { height, timestamp }))
+}
+
+/// Where to probe next in `[low, high)`, guessing from the timestamps bracketing the range.
+///
+/// Block timestamps rise at a roughly constant rate, so the height carrying a given instant can be
+/// estimated by linear interpolation between a known-earlier and a known-later block. This only
+/// chooses *where to look*; the bracket invariant, and therefore the height eventually returned, is
+/// identical whatever this returns. Falls back to the midpoint whenever the anchors cannot support
+/// an estimate — before any block below the target has been seen, or where the two anchors carry
+/// the same timestamp.
+///
+/// Note the difference from the rule that a census height's timestamp is never interpolated: this
+/// invents no timestamp and attributes none to any block. It picks a height to *ask the source*
+/// about, and every timestamp it goes on to compare is one the source answered.
+fn interpolated_probe(
+    low: u32,
+    high: u32,
+    below: Option<(u32, u64)>,
+    above: (u32, u64),
+    target: u64,
+) -> u32 {
+    let midpoint = low + (high - low) / 2;
+
+    let Some((below_height, below_timestamp)) = below else {
+        return midpoint;
+    };
+    let (above_height, above_timestamp) = above;
+    if above_height <= below_height || above_timestamp <= below_timestamp {
+        return midpoint;
+    }
+
+    let heights = u64::from(above_height - below_height);
+    let seconds = above_timestamp - below_timestamp;
+    // `target` sits in `(below_timestamp, above_timestamp]` by the bracket invariant; the clamp
+    // keeps a source that violates it from steering the estimate out of the bracket.
+    let offset = target.saturating_sub(below_timestamp).min(seconds);
+
+    // Saturating rather than plain arithmetic: `heights` and `offset` are derived from an
+    // untrusted source, and their product can exceed `u64` on absurd inputs. Plain `*` would panic
+    // in a debug build and wrap in a release one; saturating clamps identically in both, and the
+    // clamp below keeps any saturated estimate inside the bracket, so the answer is unchanged.
+    let estimate = u64::from(below_height).saturating_add(heights.saturating_mul(offset) / seconds);
+    estimate.clamp(u64::from(low), u64::from(high - 1)) as u32
+}
+
 /// The newest transaction block at or below `height`, with its timestamp.
 ///
 /// `Ok(None)` means there is no transaction block at or below `height` within the search bound
