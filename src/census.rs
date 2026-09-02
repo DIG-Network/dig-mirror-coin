@@ -348,8 +348,16 @@ pub fn census_height_seeded<S: ChainSource>(
     if let Some(seed) = seed_height.filter(|seed| *seed <= peak) {
         // Read the seed's timestamp rather than trusting the caller's claim about it. A seed whose
         // block is at or after the epoch start does not bound the answer from below and is dropped.
-        if let Some((witness, timestamp)) =
-            timestamp_at_or_below(source, seed)?.filter(|(_, t)| *t < epoch_start_unix_secs)
+        // The seed is a *hint*, so every way it can fail to answer is the same failure: the hint
+        // is unusable and the unhinted search runs. `?` here would propagate the probe's
+        // `ChainUnavailable` — a transient read error, or a run of non-transaction blocks below the
+        // seed — and fail a search that succeeds without the seed, letting a bad hint change
+        // correctness rather than only work. Only this probe is swallowed; every other read below
+        // is a real search read whose failure must propagate.
+        if let Some((witness, timestamp)) = timestamp_at_or_below(source, seed)
+            .ok()
+            .flatten()
+            .filter(|(_, t)| *t < epoch_start_unix_secs)
         {
             // The predicate is false at `seed` and true at `peak`, so `seed < peak` and this cannot
             // overflow or exceed `high`.
@@ -446,7 +454,11 @@ fn interpolated_probe(
     // keeps a source that violates it from steering the estimate out of the bracket.
     let offset = target.saturating_sub(below_timestamp).min(seconds);
 
-    let estimate = u64::from(below_height) + heights * offset / seconds;
+    // Saturating rather than wrapping: `heights` and `offset` are derived from an untrusted
+    // source, and their product can exceed `u64` on absurd inputs. A release build clamps and a
+    // debug build panics, so the arithmetic is made explicit. The clamp below keeps any saturated
+    // estimate inside the bracket, so the answer is unchanged either way.
+    let estimate = u64::from(below_height).saturating_add(heights.saturating_mul(offset) / seconds);
     estimate.clamp(u64::from(low), u64::from(high - 1)) as u32
 }
 
