@@ -167,13 +167,45 @@ impl MirrorCoin {
                 )
     }
 
-    /// The URLs the owner advertises for the store, in the order they were published.
+    /// The advertised memo tail, in the order it was published.
+    ///
+    /// Ordinarily these are the URLs the owner advertises for the store, but the tail is the owner's
+    /// free space and this method returns ALL of it: a coin may end with a `dig-peer:` peer
+    /// declaration (§5.1), which is not a URL and which
+    /// [`declared_peer`](Self::declared_peer) reads from this same list. A caller iterating these as
+    /// fetch locations should expect that entry and ignore it, exactly as it must already tolerate
+    /// any other string an owner chose to write.
     ///
     /// Unverified strings straight off the chain. Treat them as untrusted input: they have not been
     /// contacted, parsed for scheme, or bounded in number by anything but the block that carried
     /// them.
     pub fn urls(&self) -> &[String] {
         &self.urls
+    }
+
+    /// The DIG peer this coin's owner declared it collateralises, if it declared exactly one.
+    ///
+    /// Unlike every other memo-derived value on this type, this one is trustworthy for the question
+    /// it answers. It does not say who owns the coin — [`owner_puzzle_hash`](Self::owner_puzzle_hash)
+    /// answers that from the lineage proof — it says what the owner DECLARED, and only the owner's
+    /// key could produce the spend that wrote it.
+    ///
+    /// See [`crate::declared_peer`] for why two declarations name nobody.
+    pub fn declared_peer(&self) -> Option<crate::PeerDeclaration> {
+        crate::declared_peer(&self.urls)
+    }
+
+    /// Whether this coin's owner declared `peer_id` as the peer it collateralises.
+    ///
+    /// This is the binding a consumer needs before treating a stranger's claim about this coin as
+    /// evidence about that stranger. A coin bonding the right content still says nothing about who
+    /// is offering it: coin ids are public, so anyone can republish one. Only the coin's own
+    /// declaration names a claimant.
+    ///
+    /// **It binds coin to peer id and nothing further.** It does not establish that the addresses
+    /// alongside a claimed peer id reach that peer.
+    pub fn declares_peer(&self, peer_id: &str) -> bool {
+        matches!(self.declared_peer(), Some(declared) if declared.names(peer_id))
     }
 
     /// Reconstructs a mirror coin from the spend that CREATED it.

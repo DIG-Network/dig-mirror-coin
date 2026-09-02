@@ -124,19 +124,26 @@ From that execution an implementation MUST take:
   in this layout:
 
   ```
-  [ hint(32) , store(32) , root(32) , epoch(signed big-endian) , url , url , … ]
+  [ hint(32) , store(32) , root(32) , epoch(signed big-endian) , url , url , … , dig-peer:… ? ]
   ```
 
   The prefix has fixed arity. Entries 0, 1 and 2 MUST each be exactly 32 bytes; entry 3 is the epoch
   as a minimal signed big-endian integer, where an empty atom denotes zero. Every remaining entry is
-  a URL. An implementation MUST reject as not-mirror-shaped any memo list shorter than five entries
+  a URL, EXCEPT an optional trailing peer declaration (§5.1), which a writer MUST place after the
+  URLs and which a reader MUST NOT treat as a URL. An entry after the fixed prefix that is **not
+  valid UTF-8** is not an advertised term: an implementation MUST drop it rather than surface it,
+  because the tail is the owner's free space and such an entry is arbitrary bytes that denote no
+  location. The advertised terms are the entries that remain, and §5.1's count of declaration terms
+  is taken over those. An implementation MUST reject as not-mirror-shaped
+  any memo list shorter than five entries
   or whose fixed-width entries are the wrong width — a heterogeneous prefix read positionally without
   shape checks is how the ancestor layout `[hint, peerIp, publicSyntheticKey]` surfaced a public key
   as a URL.
 
-  The declared advertisement is the ONE property taken from the memos, and §4.1 states why: whoever
-  locks the collateral chooses what to stake it on, so the declaration is theirs to make and a
-  consumer's obligation is to compare it against what it asked about rather than to assume it.
+  The declared advertisement is one of exactly TWO properties taken from the memos — the other is the
+  optional peer declaration of §5.1 — and §4.1 states why this one is: whoever locks the collateral
+  chooses what to stake it on, so the declaration is theirs to make and a consumer's obligation is to
+  compare it against what it asked about rather than to assume it.
 
 A coin whose creating spend cannot be read MUST NOT be accepted.
 
@@ -160,6 +167,68 @@ An implementation MUST also carry forward what was established BEFORE the memos 
 **owner** comes from the lineage proof and is settled at that point; the memos are arbitrary bytes
 chosen by whoever spent the parent. A coin with undecodable memos therefore still has a known owner,
 and §6.2 requires that owner to remain available rather than be discarded with the memo failure.
+
+### 5.1 The peer declaration
+
+A mirror coin MAY declare the **DIG peer** its collateral stands behind. The declaration is an
+advertised memo term of the form `dig-peer:<64 hexadecimal characters>`, naming a `peer_id` as
+defined by the DIG peer network (`SHA-256` of the TLS SubjectPublicKeyInfo DER).
+
+**A writer MUST emit lowercase; a reader MUST accept either case.** The two halves are stated
+together because splitting them is an authorization difference: a reimplementation that read only the
+writer's half would refuse `dig-peer:AA11…` while this crate credits it, and the peers whose owners
+happened to write uppercase would be bonded by one implementation and not the other.
+
+Every other statement in §5 says a memo MUST NOT be believed. This one is different, and the
+difference is precise: a memo cannot establish **who owns** a coin, because anyone may write any
+bytes into their own coin's memos — but it does establish **what the owner said**, because the memos
+are written by the spend that creates the coin and only the owner's key can produce that spend. The
+declaration is therefore an owner attestation carried by executed on-chain code, and it is the only
+memo-derived value in this specification that an implementation MAY rely on against an adversary.
+
+A conforming implementation:
+
+1. MUST match the prefix `dig-peer:` exactly. `DIG-PEER:`, `dig-peers:` and `xdig-peer:` are
+   ordinary advertised strings.
+2. MUST compare peer ids as the 32 BYTES they denote, never as text. One peer id has two hex
+   spellings, and treating them as different peers withholds credit on capitalisation alone.
+3. MUST treat a coin carrying **two or more** terms with the declaration prefix as declaring
+   **nobody**, whether or not each parses. This is an economic rule, not a parsing convenience: the
+   collateral is what makes a claim cost something, so one coin standing behind several peers would
+   make each claim cost a fraction as much while every one still read as fully bonded. An owner who
+   wants two peers bonded MUST create two coins and lock the collateral twice.
+
+   **The count is over the UTF-8-decodable terms**, which are the ones §5 already keeps: a memo entry
+   that is not valid UTF-8 is not an advertised term and is dropped before this rule applies. The
+   scoping is stated because it is observable — an owner may publish a tail whose raw bytes carry two
+   prefixed entries of which only one decodes, and a reader counting raw entries would credit nobody
+   where a reader counting terms credits the one that decoded. Only that coin's own owner can create
+   the situation, and the stricter reading merely withholds credit, so this specification takes the
+   decoded count and requires implementations to do the same rather than leaving the two readings to
+   diverge silently.
+
+4. MUST NOT allow a declaration to be written other than as a declaration. A writer that also accepts
+   a free list of advertised URLs MUST refuse a URL carrying the declaration prefix, because both are
+   written into the same memo tail: without that refusal an at-most-one guarantee expressed in the
+   writer's type is not a guarantee at all. A coin whose only advertised term is a declaration
+   satisfies §5's arity rule while naming nowhere to fetch from; that is a badly-formed advertisement
+   its own owner paid for, and a consumer MUST treat it as it treats any other tail entry that is not
+   a reachable location.
+5. MUST treat a term whose payload is not exactly 64 hex characters as declaring nobody, and MUST
+   NOT fail on it. A peer id is a `SHA-256` output and has exactly one length.
+6. MUST NOT panic on any claimant string. A claimant id arrives from a provider record written by a
+   stranger, so it may be any bytes at all — including a 64-BYTE string that is not 64 characters.
+7. MUST place the declaration AFTER the advertised URLs in the memo tail, so adding one does not
+   displace the first URL for a consumer reading the list positionally.
+8. MUST NOT treat the absence of a declaration as evidence of anything. Every coin created before
+   this format existed carries none.
+
+**What the declaration establishes, and what it does not.** It binds a **coin to a peer id**. It
+does not bind a peer id to a network address, and an implementation MUST NOT read it as if it did: a
+provider record carrying an honest holder's peer id, that holder's real coin id, and an attacker's
+addresses satisfies this check completely. Closing that requires the consumer's transport to pin the
+dialled peer id against the presented certificate, which is a property of the transport and not of
+this crate. A consumer whose transport does not pin MUST NOT use a declaration to rank a holder.
 
 ## 6. The verbs
 
@@ -542,3 +611,14 @@ An implementation conforms when:
     §8.7);
 24. its census ends, rather than excluding the coin and completing, when a source answers a
     candidate's creating-spend read with a different coin's genuine spend (§8.7).
+25. a coin declares the peer its owner named and refuses every other claimant asking about that same
+    coin, and the same coin without a declaration term names nobody (§5.1);
+26. a coin carrying two declaration terms declares NEITHER of them, rather than the first by
+    position (§5.1 rule 3);
+27. a declaration is read identically whichever hex case its owner wrote it in (§5.1 rule 2), and a
+    claimant id of 64 bytes that is not 64 characters is refused rather than panicked on (§5.1
+    rule 6);
+28. its `create` writes a declaration that its own reader reads back off a real coin, so the format
+    the writer emits and the format the reader parses cannot diverge unnoticed (§5.1, §6.1).
+29. its `create` refuses an advertised URL carrying the declaration prefix, so the typed declaration
+    field is the only way a declaration is written (§5.1 rule 4).
