@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.8.0] - 2026-09-02
+
+### Features
+- **BREAKING** **coin:** Typed dig-peer declaration binding a mirror coin to a DIG peer id (#10)
+
 ## [0.7.0] - 2026-08-28
 
 ### Features
