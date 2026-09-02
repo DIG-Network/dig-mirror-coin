@@ -90,7 +90,10 @@ pub mod query;
 mod reclaim;
 
 pub use asset::{mirror_coin_puzzle_hash, DIG_ASSET_ID};
-pub use census::{census, census_height, CensusHeight, CensusOutcome, Exclusions, MirrorCensus};
+pub use census::{
+    census, census_height, census_height_seeded, CensusHeight, CensusOutcome, Exclusions,
+    MirrorCensus,
+};
 pub use coin::MirrorCoin;
 pub use create::{create, MirrorAdvertisement};
 pub use error::MirrorError;

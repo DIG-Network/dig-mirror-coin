@@ -179,6 +179,15 @@ fn seeded_and_unseeded_searches_agree_on_every_epoch_of_every_chain() {
                     chain.spacing, chain.tx_percent
                 );
 
+                // The seeded search with NO seed is the same code path minus the bound, so it must
+                // also agree with the shipped bisection — otherwise the interpolated probe itself,
+                // rather than the seed, would be the thing changing the answer.
+                assert_eq!(
+                    census_height_seeded(&chain, start, None).expect("seeded search answers"),
+                    expected,
+                    "the interpolated probe alone changed the answer at {start}"
+                );
+
                 assert!(expected.is_some(), "epoch {start} should be reachable");
                 seed = actual.map(|found| found.height);
                 compared += 1;
